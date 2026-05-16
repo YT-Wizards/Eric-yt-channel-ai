@@ -43,3 +43,7 @@ API keys, OAuth tokens, chat history, transcripts, analytics cache — all there
 ## How to stop the app
 
 Just close the terminal window the server is running in. The database closes cleanly on shutdown — nothing is lost.
+
+## How to update
+
+When the developer ships fixes or new features, follow **[UPDATE.md](./UPDATE.md)** — full step-by-step instructions, written for someone with no coding background. Covers both ZIP-based and GitHub Desktop-based installs, and explains how to switch to GitHub Desktop if you want one-click updates in the future.
