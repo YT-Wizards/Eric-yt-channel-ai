@@ -2574,6 +2574,157 @@ export function listVideosMissingTranscript(): {
   }[];
 }
 
+/* ------------------------------------------------------------------ *
+ * Flexible "what to transcribe" picker (Phase 1 of the transcribe-
+ * batch UX rework).
+ *
+ * The old flow only had ONE bulk option: "transcribe everything missing".
+ * The new UI lets the user choose between
+ *   - all missing (legacy default)
+ *   - top N ordered by views / recency / oldest, optionally restricted
+ *     to videos still missing a transcript
+ *   - a hand-picked list of video IDs
+ *
+ * To support that without scattering query-building across routes, we
+ * expose two helpers:
+ *   1. listChannelVideosForTranscribe(opts) — sorted/filtered/limited
+ *      list of candidates plus their transcript status, used by the
+ *      modal that lets the user pick what they want.
+ *   2. getVideosByIds(ids) — strict lookup of metadata for the IDs the
+ *      user actually picked (channel-scoped, so a malicious caller
+ *      can't sneak in IDs from a different channel).
+ * ------------------------------------------------------------------ */
+
+export type TranscribeCandidate = {
+  id: string;
+  title: string;
+  duration_seconds: number | null;
+  views: number;
+  published_at: number | null;
+  has_transcript: boolean;
+};
+
+const TRANSCRIBE_SUSPICIOUS_CHARS_PER_SEC = 3;
+
+/**
+ * Active-channel-scoped video list for the bulk-transcribe picker UI.
+ *
+ *   onlyMissing — if true, filters out videos that already have a
+ *     usable transcript (same heuristic as listVideosMissingTranscript:
+ *     no transcript at all, OR suspiciously short transcript-text/
+ *     duration ratio that suggests a previous bad transcribe).
+ *   orderBy — "views" | "recent" | "oldest". Default "recent".
+ *   limit — caps the result set; useful for the "top N" CTA so we
+ *     don't ship the whole 500-video catalogue to the browser when
+ *     the user only cares about the top 10.
+ */
+export function listChannelVideosForTranscribe(
+  opts: {
+    onlyMissing?: boolean;
+    orderBy?: "views" | "recent" | "oldest";
+    limit?: number;
+  } = {}
+): TranscribeCandidate[] {
+  const activeId = getActiveChannelId();
+  if (!activeId) return [];
+
+  const order =
+    opts.orderBy === "views"
+      ? "v.views DESC"
+      : opts.orderBy === "oldest"
+        ? "COALESCE(v.published_at, v.imported_at) ASC"
+        : "COALESCE(v.published_at, v.imported_at) DESC";
+
+  // The missing-only filter uses an INLINE expression instead of a CASE
+  // / sub-query so SQLite can still hit the index on (channel_id,
+  // published_at) for the ORDER BY. Same heuristic as
+  // listVideosMissingTranscript.
+  const missingClause = opts.onlyMissing
+    ? `AND (
+        t.video_id IS NULL
+        OR (
+          v.duration_seconds IS NOT NULL
+          AND v.duration_seconds > 60
+          AND (LENGTH(t.text) * 1.0 / v.duration_seconds) < ?
+        )
+      )`
+    : "";
+
+  const limitClause =
+    opts.limit && opts.limit > 0
+      ? `LIMIT ${Math.floor(Math.max(1, opts.limit))}`
+      : "";
+
+  const sql = `
+    SELECT
+      v.id,
+      v.title,
+      v.duration_seconds,
+      v.views,
+      v.published_at,
+      CASE WHEN t.video_id IS NULL THEN 0 ELSE 1 END AS has_transcript_int
+    FROM videos v
+    LEFT JOIN transcripts t ON t.video_id = v.id
+    WHERE v.channel_id = ?
+    ${missingClause}
+    ORDER BY ${order}
+    ${limitClause}
+  `;
+
+  const args: unknown[] = [activeId];
+  if (opts.onlyMissing) args.push(TRANSCRIBE_SUSPICIOUS_CHARS_PER_SEC);
+
+  const rows = db.prepare(sql).all(...args) as Array<{
+    id: string;
+    title: string;
+    duration_seconds: number | null;
+    views: number | null;
+    published_at: number | null;
+    has_transcript_int: number;
+  }>;
+
+  return rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    duration_seconds: r.duration_seconds,
+    views: r.views ?? 0,
+    published_at: r.published_at,
+    has_transcript: r.has_transcript_int === 1,
+  }));
+}
+
+/**
+ * Look up metadata for a specific list of video IDs, restricted to the
+ * active channel. Used when the user picks a custom set in the batch-
+ * transcribe modal — we still channel-scope the lookup so that a
+ * crafted request can't accidentally transcribe videos from a
+ * different connected channel.
+ */
+export function getVideosByIds(ids: string[]): Array<{
+  id: string;
+  title: string;
+  duration_seconds: number | null;
+}> {
+  if (ids.length === 0) return [];
+  const activeId = getActiveChannelId();
+  if (!activeId) return [];
+  // Dedup + cap at 500 IDs so we can't build a 10k-wide IN list by
+  // accident. The UI will never legitimately need more.
+  const unique = Array.from(new Set(ids)).slice(0, 500);
+  const placeholders = unique.map(() => "?").join(",");
+  return db
+    .prepare(
+      `SELECT id, title, duration_seconds
+       FROM videos
+       WHERE channel_id = ? AND id IN (${placeholders})`
+    )
+    .all(activeId, ...unique) as Array<{
+    id: string;
+    title: string;
+    duration_seconds: number | null;
+  }>;
+}
+
 export type TranscriptionJob = {
   id: number;
   started_at: number;

@@ -4,10 +4,13 @@ import {
   getActiveTranscriptionJob,
   getIntegration,
   getSetting,
+  getVideosByIds,
+  listChannelVideosForTranscribe,
   listVideosMissingTranscript,
   recordDeepgramUsage,
   updateTranscriptionJob,
   upsertTranscript,
+  type TranscribeCandidate,
 } from "@/lib/db";
 import { estimateCostCents, transcribeYouTubeVideo } from "@/lib/deepgram";
 import { log } from "@/lib/logger";
@@ -20,24 +23,147 @@ export const maxDuration = 300;
  * margin under the tier limit. Configurable via settings in future. */
 const DEFAULT_CONCURRENCY = 3;
 
+type OrderBy = "views" | "recent" | "oldest";
+
 /**
- * GET — return a cost preview for the user's current unboxed state so the
- * confirmation modal can show "N videos · M hours · ~$X" before they commit.
- * Does NOT start anything.
+ * Resolve query/body parameters into a concrete list of videos to
+ * transcribe. Shared between GET (preview) and POST (start).
+ *
+ * Three selection modes (priority order):
+ *   1. videoIds — caller picked a specific list. Look them up directly.
+ *   2. topN + orderBy — caller wants the top N videos by some sort.
+ *   3. Legacy default — "all videos missing a transcript", as before.
+ *
+ * `onlyMissing` defaults to true for ALL modes — even when the user
+ * picks specific IDs we still try to skip ones that already have a
+ * usable transcript, unless they explicitly set onlyMissing=false to
+ * force a re-transcribe.
  */
-export async function GET() {
-  const missing = listVideosMissingTranscript();
-  const totalSeconds = missing.reduce((sum, v) => sum + (v.duration_seconds ?? 0), 0);
-  const estimatedCostCents = missing.reduce(
+function resolveBatchVideos(opts: {
+  videoIds?: string[];
+  topN?: number;
+  orderBy?: OrderBy;
+  onlyMissing?: boolean;
+}): Array<{ id: string; title: string; duration_seconds: number | null }> {
+  const onlyMissing = opts.onlyMissing ?? true;
+
+  // 1. Explicit ID list
+  if (opts.videoIds && opts.videoIds.length > 0) {
+    const found = getVideosByIds(opts.videoIds);
+    if (!onlyMissing) return found;
+    // Skip ones that already have a transcript (use the same heuristic
+    // as the picker by re-checking against the active-channel candidate
+    // list).
+    const missing = new Set(
+      listChannelVideosForTranscribe({ onlyMissing: true }).map((v) => v.id)
+    );
+    return found.filter((v) => missing.has(v.id));
+  }
+
+  // 2. Top N
+  if (opts.topN && opts.topN > 0) {
+    const list = listChannelVideosForTranscribe({
+      onlyMissing,
+      orderBy: opts.orderBy,
+      limit: opts.topN,
+    });
+    return list.map((v) => ({
+      id: v.id,
+      title: v.title,
+      duration_seconds: v.duration_seconds,
+    }));
+  }
+
+  // 3. Legacy default
+  return listVideosMissingTranscript();
+}
+
+function parseOrderBy(raw: string | null | undefined): OrderBy | undefined {
+  if (raw === "views" || raw === "recent" || raw === "oldest") return raw;
+  return undefined;
+}
+
+function parsePositiveInt(raw: string | null | undefined): number | undefined {
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.floor(n);
+}
+
+/**
+ * GET — preview the batch the user is about to start.
+ *
+ * Query params (all optional; falls back to legacy "all missing"):
+ *   ?topN=10&orderBy=views      — preview a top-N batch
+ *   ?videoIds=abc,def           — preview a hand-picked batch
+ *   ?onlyMissing=0              — include already-transcribed videos
+ *
+ * Returns the same shape it always did, plus a `candidates` field on
+ * the new `?candidates=1` query mode — the picker UI calls that to
+ * populate the "pick specific videos" list.
+ */
+export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const params = url.searchParams;
+
+  // Picker mode — return the full candidate list for the modal UI.
+  if (params.get("candidates") === "1") {
+    const candidates = listChannelVideosForTranscribe({
+      onlyMissing: params.get("onlyMissing") === "0" ? false : undefined,
+      orderBy: parseOrderBy(params.get("orderBy")),
+      limit: parsePositiveInt(params.get("limit")) ?? 500,
+    });
+    return NextResponse.json({
+      candidates: candidates.map((c) => ({
+        id: c.id,
+        title: c.title,
+        views: c.views,
+        durationSeconds: c.duration_seconds ?? 0,
+        publishedAt: c.published_at,
+        hasTranscript: c.has_transcript,
+        estimatedCostCents: estimateCostCents(c.duration_seconds ?? 0),
+      })) satisfies Array<{
+        id: string;
+        title: string;
+        views: number;
+        durationSeconds: number;
+        publishedAt: number | null;
+        hasTranscript: boolean;
+        estimatedCostCents: number;
+      }>,
+    });
+  }
+
+  const videoIdsParam = params.get("videoIds");
+  const videoIds = videoIdsParam
+    ? videoIdsParam
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : undefined;
+
+  const selection = resolveBatchVideos({
+    videoIds,
+    topN: parsePositiveInt(params.get("topN")),
+    orderBy: parseOrderBy(params.get("orderBy")),
+    onlyMissing: params.get("onlyMissing") === "0" ? false : undefined,
+  });
+
+  const totalSeconds = selection.reduce(
+    (sum, v) => sum + (v.duration_seconds ?? 0),
+    0
+  );
+  const estimatedCostCents = selection.reduce(
     (sum, v) => sum + estimateCostCents(v.duration_seconds ?? 0),
     0
   );
   const active = getActiveTranscriptionJob();
+
   return NextResponse.json({
-    missing: missing.length,
+    missing: selection.length,
     totalSeconds,
     estimatedCostCents,
-    videos: missing.slice(0, 5).map((v) => ({
+    videos: selection.slice(0, 5).map((v) => ({
       id: v.id,
       title: v.title,
       durationSeconds: v.duration_seconds ?? 0,
@@ -46,12 +172,27 @@ export async function GET() {
   });
 }
 
+type PostBody = {
+  videoIds?: string[];
+  topN?: number;
+  orderBy?: OrderBy;
+  onlyMissing?: boolean;
+};
+
 /**
  * POST — kick off the batch. Returns immediately with the jobId; the
  * background async task does the work. UI polls /api/deepgram/jobs/latest
  * for live progress.
+ *
+ * Body (all optional; empty body = legacy "all missing" behaviour):
+ *   {
+ *     videoIds?: string[],        // hand-picked list, channel-scoped
+ *     topN?: number,              // pick top N by orderBy
+ *     orderBy?: "views"|"recent"|"oldest",  // default "recent"
+ *     onlyMissing?: boolean       // default true; set false to re-transcribe
+ *   }
  */
-export async function POST() {
+export async function POST(req: Request) {
   const apiKey = getIntegration("deepgram")?.api_key;
   if (!apiKey) {
     return NextResponse.json(
@@ -80,22 +221,54 @@ export async function POST() {
     );
   }
 
-  const missing = listVideosMissingTranscript();
-  if (missing.length === 0) {
-    return NextResponse.json({ error: "No videos missing a transcript." }, { status: 400 });
+  // POST body is optional — JSON.parse('') throws, so guard it.
+  let body: PostBody = {};
+  try {
+    const text = await req.text();
+    if (text.trim()) {
+      const parsed = JSON.parse(text) as unknown;
+      if (parsed && typeof parsed === "object") body = parsed as PostBody;
+    }
+  } catch {
+    // Malformed body — treat as empty and fall back to legacy behaviour
+    // rather than 400'ing. Easier on the user.
   }
 
-  const jobId = createTranscriptionJob(missing.length);
+  const videos = resolveBatchVideos({
+    videoIds: Array.isArray(body.videoIds)
+      ? body.videoIds.filter((s): s is string => typeof s === "string")
+      : undefined,
+    topN: typeof body.topN === "number" ? body.topN : undefined,
+    orderBy: parseOrderBy(typeof body.orderBy === "string" ? body.orderBy : null),
+    onlyMissing: body.onlyMissing,
+  });
+
+  if (videos.length === 0) {
+    return NextResponse.json(
+      {
+        error:
+          "Nothing to transcribe. Either the selection is empty, every picked video already has a transcript, or no channel is active.",
+      },
+      { status: 400 }
+    );
+  }
+
+  const jobId = createTranscriptionJob(videos.length);
   log.info("deepgram", "Batch transcription job started", {
     jobId,
-    videoCount: missing.length,
+    videoCount: videos.length,
+    selectionMode: body.videoIds?.length
+      ? "ids"
+      : body.topN
+        ? `top${body.topN}/${body.orderBy ?? "recent"}`
+        : "all-missing",
   });
 
   // Fire and forget. `void` tells ESLint and readers "yes, we mean to not
   // await this — the response goes back now, the batch runs in background".
-  void runBatch(jobId, apiKey, missing);
+  void runBatch(jobId, apiKey, videos);
 
-  return NextResponse.json({ ok: true, jobId, total: missing.length });
+  return NextResponse.json({ ok: true, jobId, total: videos.length });
 }
 
 async function runBatch(
@@ -173,3 +346,7 @@ async function runBatch(
     log.error("deepgram", `Batch transcription job crashed: ${msg}`, err, { jobId });
   }
 }
+
+// Re-export the type so the route's TypeScript users see the canonical
+// shape (kept here so the import-graph from the picker UI stays clean).
+export type { TranscribeCandidate };
