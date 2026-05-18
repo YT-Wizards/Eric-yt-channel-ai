@@ -42,14 +42,17 @@ export default function IntegrationsPage() {
     link: string;
     linkLabel: string;
   };
-  const items: {
+  type Item = {
     name: Name;
     label: string;
     desc: string;
     placeholder: string;
     mode: ItemMode;
     help: Help;
-  }[] = [
+  };
+  // Source-of-truth list. Grouping decisions below operate on these
+  // entries by name so we don't repeat the help/label data.
+  const items: Item[] = [
     {
       name: "claude",
       label: t.integrations.claude.name,
@@ -130,6 +133,31 @@ export default function IntegrationsPage() {
     },
   ];
 
+  // Group items by purpose so a non-technical user sees a shorter,
+  // sequenced list instead of one undifferentiated stack of 6+ cards.
+  // The order inside each group matters too: YouTube first in Core (the
+  // very first thing a new user needs), then the AI providers stacked
+  // as alternatives, then optional add-ons.
+  const byName = (n: Name): Item | undefined => items.find((i) => i.name === n);
+  const groups: {
+    title: string;
+    description: string;
+    names: Name[];
+  }[] = [
+    {
+      title: "Core — fill at least one AI key + YouTube",
+      description:
+        "The minimum to make the app useful: a YouTube Data API key to load videos and stats, plus an AI provider (Claude or Gemini) to power the chat / Hook Lab / advisor.",
+      names: ["youtube", "claude", "google_gemini"],
+    },
+    {
+      title: "Optional add-ons",
+      description:
+        "Add when you want the feature. Deepgram unlocks transcription for videos without YouTube captions. Apify is the competitor-sync fallback. Exa adds web search inside the AI Chat.",
+      names: ["deepgram", "apify", "exa"],
+    },
+  ];
+
   return (
     <div className="mx-auto max-w-3xl">
       <header className="mb-6">
@@ -137,21 +165,57 @@ export default function IntegrationsPage() {
         <p className="mt-1 text-sm text-muted-foreground">{t.integrations.subtitle}</p>
       </header>
 
-      <div className="space-y-4">
-        {items.map((it) => (
-          <IntegrationCard
-            key={it.name}
-            name={it.name}
-            label={it.label}
-            desc={it.desc}
-            placeholder={it.placeholder}
-            mode={it.mode}
-            help={it.help}
-            status={status?.[it.name]}
-            onSaved={load}
-          />
+      <div className="space-y-8">
+        {groups.map((g) => (
+          <section key={g.title} className="space-y-3">
+            <div>
+              <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+                {g.title}
+              </h2>
+              <p className="mt-1 text-xs text-muted-foreground">{g.description}</p>
+            </div>
+            {g.names.map((n) => {
+              const it = byName(n);
+              if (!it) return null;
+              return (
+                <IntegrationCard
+                  key={it.name}
+                  name={it.name}
+                  label={it.label}
+                  desc={it.desc}
+                  placeholder={it.placeholder}
+                  mode={it.mode}
+                  help={it.help}
+                  status={status?.[it.name]}
+                  onSaved={load}
+                />
+              );
+            })}
+          </section>
         ))}
-        <GoogleOAuthConnector />
+
+        {/* Advanced — collapsed by default. Google OAuth is heavier
+            (full Studio Analytics, private API access) and most
+            beginners can ignore it; this prevents the page from
+            scaring them with a wall of "Connect Google" UI before
+            they've even pasted their first API key. */}
+        <section className="space-y-3">
+          <h2 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+            Advanced
+          </h2>
+          <p className="text-xs text-muted-foreground">
+            Heavier authentication flows. Skip unless you specifically need
+            them.
+          </p>
+          <details className="rounded-md border border-border bg-muted/10">
+            <summary className="cursor-pointer select-none px-4 py-3 text-sm font-medium hover:bg-muted/30">
+              Google OAuth — Studio Analytics & private API access
+            </summary>
+            <div className="border-t border-border/60 p-3">
+              <GoogleOAuthConnector />
+            </div>
+          </details>
+        </section>
       </div>
     </div>
   );

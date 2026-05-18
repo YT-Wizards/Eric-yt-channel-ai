@@ -17,9 +17,34 @@ import {
   BarChart3,
   BookmarkPlus,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { useI18n } from "@/lib/i18n/provider";
 import { useUiPref } from "@/lib/ui-prefs";
 import { cn } from "@/lib/utils";
+
+/**
+ * Left navigation. Items are grouped into named sections so the user
+ * can find related pages without scanning the whole list — Vlad's
+ * feedback: "все більше й більше і все якось незручно виглядає".
+ *
+ * Sections — and the routes that belong in them — are defined inline
+ * in the component body so they can pick up live i18n strings and the
+ * showLogs UI preference. Each section renders its label in muted
+ * caps above its items; an empty section (all items hidden) renders
+ * nothing at all.
+ */
+
+type NavItem = {
+  href: string;
+  label: string;
+  icon: LucideIcon;
+  badge: number;
+};
+
+type NavSection = {
+  label: string | null; // null = no header (shown as the top "main" block)
+  items: NavItem[];
+};
 
 export function Sidebar() {
   const { t } = useI18n();
@@ -53,39 +78,73 @@ export function Sidebar() {
     };
   }, []);
 
-  const items = [
-    { href: "/", label: t.nav.dashboard, icon: LayoutDashboard, badge: 0 },
-    { href: "/videos", label: t.nav.videos, icon: Video, badge: 0 },
-    { href: "/hooks", label: "Hook Lab", icon: Sparkles, badge: 0 },
+  // Grouped nav.
+  //   Main         — the everyday entry points (Dashboard, Videos, Chat).
+  //   Title Insights — anything that pokes at your titles/hooks: AI Hook
+  //                  Lab scoring + statistical word/length analyzer +
+  //                  manual library of saved hook quotes.
+  //   Research     — looking outside your own channel (competitors and
+  //                  their viral-alert feed; the per-channel /alerts page
+  //                  is kept as a power-user surface).
+  //   Config       — keys, settings, optional logs viewer.
+  const sections: NavSection[] = [
     {
-      href: "/formula-analyzer",
-      label: "Formula Analyzer",
-      icon: BarChart3,
-      badge: 0,
+      label: null,
+      items: [
+        { href: "/", label: t.nav.dashboard, icon: LayoutDashboard, badge: 0 },
+        { href: "/videos", label: t.nav.videos, icon: Video, badge: 0 },
+        { href: "/chat", label: t.nav.chat, icon: MessageSquare, badge: 0 },
+      ],
     },
     {
-      href: "/hooks-library",
-      label: "Hooks Library",
-      icon: BookmarkPlus,
-      badge: 0,
+      label: "Title insights",
+      items: [
+        { href: "/hooks", label: "Hook Lab", icon: Sparkles, badge: 0 },
+        {
+          href: "/formula-analyzer",
+          label: "Formula Analyzer",
+          icon: BarChart3,
+          badge: 0,
+        },
+        {
+          href: "/hooks-library",
+          label: "Hooks Library",
+          icon: BookmarkPlus,
+          badge: 0,
+        },
+      ],
     },
-    { href: "/chat", label: t.nav.chat, icon: MessageSquare, badge: 0 },
     {
-      href: "/competitors",
-      label: "Competitors",
-      icon: Search,
-      badge: unreadAlerts,
+      label: "Research",
+      items: [
+        {
+          href: "/competitors",
+          label: "Competitors",
+          icon: Search,
+          badge: unreadAlerts,
+        },
+        { href: "/alerts", label: "Alerts", icon: Bell, badge: 0 },
+      ],
     },
-    { href: "/alerts", label: "Alerts", icon: Bell, badge: 0 },
-    { href: "/integrations", label: t.nav.integrations, icon: Plug, badge: 0 },
-    // Logs entry is opt-in — only rendered when the Settings toggle
-    // flips `showLogs` on. The /logs route stays reachable by direct
-    // URL either way.
-    ...(showLogs
-      ? [{ href: "/logs", label: t.nav.logs, icon: ScrollText, badge: 0 }]
-      : []),
-    { href: "/settings", label: t.nav.settings, icon: Settings, badge: 0 },
+    {
+      label: "Config",
+      items: [
+        { href: "/integrations", label: t.nav.integrations, icon: Plug, badge: 0 },
+        // Logs entry is opt-in — only rendered when the Settings toggle
+        // flips `showLogs` on. The /logs route stays reachable by direct
+        // URL either way.
+        ...(showLogs
+          ? [{ href: "/logs", label: t.nav.logs, icon: ScrollText, badge: 0 }]
+          : []),
+        { href: "/settings", label: t.nav.settings, icon: Settings, badge: 0 },
+      ],
+    },
   ];
+
+  const isActive = (href: string): boolean =>
+    href === "/"
+      ? pathname === "/"
+      : pathname === href || pathname.startsWith(href + "/");
 
   return (
     <aside className="flex h-screen w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
@@ -99,37 +158,49 @@ export function Sidebar() {
         </div>
       </div>
 
-      <nav className="flex-1 px-3 py-2">
-        <ul className="space-y-1">
-          {items.map((item) => {
-            const active =
-              item.href === "/"
-                ? pathname === "/"
-                : pathname === item.href || pathname.startsWith(item.href + "/");
-            const Icon = item.icon;
-            return (
-              <li key={item.href}>
-                <Link
-                  href={item.href}
-                  className={cn(
-                    "flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors",
-                    active
-                      ? "bg-primary/10 text-primary font-medium"
-                      : "text-sidebar-foreground/80 hover:bg-accent hover:text-accent-foreground"
-                  )}
-                >
-                  <Icon className="h-4 w-4" />
-                  <span className="flex-1">{item.label}</span>
-                  {item.badge > 0 && (
-                    <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
-                      {item.badge}
-                    </span>
-                  )}
-                </Link>
-              </li>
-            );
-          })}
-        </ul>
+      <nav className="flex-1 overflow-y-auto px-3 py-2">
+        {sections.map((section, sectionIdx) => {
+          if (section.items.length === 0) return null;
+          return (
+            <div
+              key={section.label ?? `main-${sectionIdx}`}
+              className={cn(sectionIdx > 0 && "mt-4")}
+            >
+              {section.label && (
+                <div className="mb-1 px-3 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
+                  {section.label}
+                </div>
+              )}
+              <ul className="space-y-1">
+                {section.items.map((item) => {
+                  const active = isActive(item.href);
+                  const Icon = item.icon;
+                  return (
+                    <li key={item.href}>
+                      <Link
+                        href={item.href}
+                        className={cn(
+                          "flex items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors",
+                          active
+                            ? "bg-primary/10 text-primary font-medium"
+                            : "text-sidebar-foreground/80 hover:bg-accent hover:text-accent-foreground"
+                        )}
+                      >
+                        <Icon className="h-4 w-4" />
+                        <span className="flex-1">{item.label}</span>
+                        {item.badge > 0 && (
+                          <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
+                            {item.badge}
+                          </span>
+                        )}
+                      </Link>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          );
+        })}
       </nav>
 
       <div className="px-5 py-4 text-xs text-muted-foreground border-t border-sidebar-border">
