@@ -84,6 +84,21 @@ export interface StreamTurnOpts {
   messages: Anthropic.MessageParam[];
   tools: Anthropic.Tool[];
   maxTokens: number;
+  /**
+   * Enable the provider's native server-side web search. When true:
+   *   - Claude: attaches the `web_search_20260209` server tool. Anthropic
+   *     executes the search and feeds results back to the model in the
+   *     same turn — we see no extra function_call to dispatch, just
+   *     extra server_tool_use + web_search_tool_result content blocks.
+   *   - Gemini: not wired yet. The legacy SDK exposes
+   *     `googleSearchRetrieval`, but that grounding mode doesn't compose
+   *     with function declarations in one request and would break our
+   *     existing local tools. Until we migrate to the newer @google/genai
+   *     SDK and Gemini 2.0+ native `google_search` tool, we silently
+   *     ignore this flag on Gemini turns. Users who specifically need
+   *     web search can switch the chat header to Claude.
+   */
+  webSearch?: boolean;
   /** Called for every text delta — same shape both providers, raw text only. */
   onText: (delta: string) => void;
 }
@@ -106,12 +121,31 @@ async function runClaudeTurn(
   opts: StreamTurnOpts
 ): Promise<UnifiedTurnResult> {
   const client = new Anthropic({ apiKey: opts.apiKey });
+
+  // Compose the final tools list. Claude's `tools` array can mix our
+  // local function tools with Anthropic-managed server tools (web_search,
+  // web_fetch, code_execution, ...). When opts.webSearch is on we append
+  // the 2026-02-09 web_search tool — Anthropic does the network call on
+  // its side and feeds the results back into the model's context inside
+  // the same turn. The resulting message contains extra content blocks
+  // we just have to NOT mistake for function calls.
+  // max_uses=5 is a safety cap so a single chat turn can't burn 50
+  // searches via runaway prompting.
+  const composedTools: Anthropic.ToolUnion[] = [...opts.tools];
+  if (opts.webSearch) {
+    composedTools.push({
+      type: "web_search_20260209",
+      name: "web_search",
+      max_uses: 5,
+    } satisfies Anthropic.WebSearchTool20260209);
+  }
+
   const stream = client.messages.stream({
     model: providerModelId("claude"),
     max_tokens: opts.maxTokens,
     system: opts.system,
     messages: opts.messages,
-    tools: opts.tools.length ? opts.tools : undefined,
+    tools: composedTools.length ? composedTools : undefined,
   });
 
   stream.on("text", (text) => opts.onText(text));
@@ -122,6 +156,7 @@ async function runClaudeTurn(
     if (b.type === "text") {
       blocks.push({ type: "text", text: b.text });
     } else if (b.type === "tool_use") {
+      // FUNCTION call — our chat-tools dispatcher needs to run it.
       blocks.push({
         type: "tool_use",
         id: b.id,
@@ -129,6 +164,12 @@ async function runClaudeTurn(
         input: (b.input ?? {}) as Record<string, unknown>,
       });
     }
+    // server_tool_use + web_search_tool_result + web_fetch_tool_result
+    // are intentionally NOT mapped into UnifiedContentBlock — they're
+    // executed entirely by Anthropic; our loop doesn't need to dispatch
+    // anything. They still live in `final.content` and get persisted
+    // back to the next iteration's history along with everything else,
+    // so the model sees the search results on subsequent turns.
   }
 
   const usage = final.usage as {

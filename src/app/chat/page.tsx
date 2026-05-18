@@ -15,7 +15,6 @@ import {
   Wrench,
   Check,
   PlaySquare,
-  Globe,
   Bot,
   BarChart3,
   TrendingUp,
@@ -64,9 +63,9 @@ type Message = {
   attachments?: AttachmentRef[];
 };
 
-type ToolGroup = "youtube" | "analytics" | "research" | "exa" | "apify" | "yt_analytics" | "strategy";
+type ToolGroup = "youtube" | "analytics" | "research" | "apify" | "yt_analytics" | "strategy";
 type IntegrationsStatus = Record<
-  "claude" | "youtube" | "exa" | "apify" | "google_gemini",
+  "claude" | "youtube" | "apify" | "google_gemini",
   { hasKey: boolean } | undefined
 >;
 
@@ -76,7 +75,7 @@ const TOOL_DEFS: {
   key: ToolGroup;
   label: string;
   description: string;
-  requires: "youtube" | "exa" | "apify" | null;
+  requires: "youtube" | "apify" | null;
   icon: React.ComponentType<{ className?: string }>;
 }[] = [
   {
@@ -114,14 +113,6 @@ const TOOL_DEFS: {
       "YouTube autocomplete (what people actually search for) — useful for keyword research and content ideas.",
     requires: null,
     icon: TrendingUp,
-  },
-  {
-    key: "exa",
-    label: "Exa (web search)",
-    description:
-      "Semantic web search outside YouTube — articles, news, industry context, anything Claude needs to know about the world.",
-    requires: "exa",
-    icon: Globe,
   },
   {
     key: "strategy",
@@ -282,8 +273,11 @@ function ChatPageInner() {
           if (ints?.youtube?.hasKey) {
             defaults.add("youtube");
             defaults.add("analytics");
+            // "research" is youtube_suggest only — same API key, free.
+            // Enabling it by default gets the model live search-demand
+            // data when planning ideas without an extra toggle.
+            defaults.add("research");
           }
-          if (ints?.exa?.hasKey) defaults.add("exa");
           if (ints?.apify?.hasKey) defaults.add("apify");
           return defaults;
         });

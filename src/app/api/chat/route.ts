@@ -43,13 +43,17 @@ const MAX_TOOL_ITERATIONS = 12;
 // the model from burning iterations re-calling a broken tool.
 const TOOL_FAILURE_LOCK_AT = 2;
 
+// Note: "strategy" is intentionally excluded here — it's enabled by
+// default further down. The chat UI's "+" picker treats it as required
+// for ideation flows. Adding it to this allow-list too would double-
+// register the toolset whenever the picker passes it through.
 const ALLOWED_GROUPS: ToolGroup[] = [
   "youtube",
   "analytics",
   "research",
-  "exa",
   "apify",
   "yt_analytics",
+  "strategy",
 ];
 
 function encodeSSE(data: unknown): Uint8Array {
@@ -235,6 +239,11 @@ export async function POST(req: Request) {
             messages,
             tools,
             maxTokens: MAX_TOKENS,
+            // Built-in web search is always on for Claude turns — Anthropic
+            // handles the fetch server-side and the model decides when to
+            // reach out. On Gemini turns the flag is a silent no-op until
+            // we migrate to a newer SDK (see ai-provider.ts comment).
+            webSearch: true,
             onText: (text) => {
               iterText += text;
               send({ type: "delta", text });
@@ -381,6 +390,11 @@ export async function POST(req: Request) {
             system,
             messages,
             tools: [], // tools off for synthesis
+            // Web search also off for the synthesis round — by this point
+            // we've spent the research budget on purpose. Letting the
+            // model issue more searches here defeats the "write the
+            // answer now" instruction.
+            webSearch: false,
             maxTokens: SYNTHESIS_MAX_TOKENS,
             onText: (text) => {
               synthText += text;

@@ -36,7 +36,6 @@ import {
   searchYouTube,
   youtubeSuggest,
 } from "./youtube";
-import { exaGetContents, exaSearch } from "./exa";
 import { apifyYouTubeScrape } from "./apify";
 import { transcribeYouTubeVideo } from "./deepgram";
 import { runSelect, SQL_SCHEMA } from "./sql-tool";
@@ -51,10 +50,16 @@ import {
 } from "./yt-analytics";
 import { getOAuthTokens } from "./google-oauth";
 
-/** A tool group the user can enable/disable via the "+" menu in chat. */
+/**
+ * A tool group the user can enable/disable via the "+" menu in chat.
+ *
+ * Web search isn't a group here — Anthropic's native web_search is wired
+ * unconditionally for Claude turns (see ai-provider.ts). The previous
+ * `exa` group is intentionally removed: it duplicated the same feature
+ * less reliably and the toggle made the picker feel cluttered.
+ */
 export type ToolGroup =
   | "youtube"
-  | "exa"
   | "apify"
   | "analytics"
   | "research"
@@ -167,38 +172,6 @@ const YOUTUBE_TOOLS: Tool[] = [
         maxResults: { type: "number", default: 10 },
       },
       required: ["query"],
-    },
-  },
-];
-
-const EXA_TOOLS: Tool[] = [
-  {
-    name: "web_search",
-    description:
-      "Semantic web search via Exa AI. Use for research, trends, news, competitor intel, industry data. Returns titles, URLs, and (if requested) text snippets.",
-    input_schema: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        numResults: { type: "number", default: 8 },
-        includeText: {
-          type: "boolean",
-          default: true,
-          description: "Include text snippets from each page.",
-        },
-      },
-      required: ["query"],
-    },
-  },
-  {
-    name: "web_fetch",
-    description: "Fetch cleaned readable text of specific URLs via Exa. Use after web_search to drill into promising results.",
-    input_schema: {
-      type: "object",
-      properties: {
-        urls: { type: "array", items: { type: "string" }, maxItems: 5 },
-      },
-      required: ["urls"],
     },
   },
 ];
@@ -501,7 +474,6 @@ export function getToolsFor(groups: ToolGroup[]): Tool[] {
   if (set.has("youtube")) tools.push(...YOUTUBE_TOOLS);
   if (set.has("analytics")) tools.push(...ANALYTICS_TOOLS);
   if (set.has("research")) tools.push(...RESEARCH_TOOLS);
-  if (set.has("exa")) tools.push(...EXA_TOOLS);
   if (set.has("apify")) tools.push(...APIFY_TOOLS);
   if (set.has("yt_analytics")) tools.push(...YT_ANALYTICS_TOOLS);
   if (set.has("strategy")) tools.push(...STRATEGY_TOOLS);
@@ -626,25 +598,6 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
         const type = (input.type === "channel" ? "channel" : "video") as "video" | "channel";
         const maxResults = Math.min(25, Math.max(1, Number(input.maxResults) || 10));
         return { ok: true, data: await searchYouTube(query, key, { type, maxResults }) };
-      }
-      case "web_search": {
-        const key = requireKey("exa");
-        const query = String(input.query ?? "").trim();
-        if (!query) return { ok: false, error: "query required" };
-        const numResults = Math.min(20, Math.max(1, Number(input.numResults) || 8));
-        const includeText = input.includeText !== false;
-        return {
-          ok: true,
-          data: await exaSearch(query, key, { numResults, includeText }),
-        };
-      }
-      case "web_fetch": {
-        const key = requireKey("exa");
-        const urls = Array.isArray(input.urls)
-          ? (input.urls as unknown[]).filter((u): u is string => typeof u === "string").slice(0, 5)
-          : [];
-        if (!urls.length) return { ok: false, error: "urls required" };
-        return { ok: true, data: await exaGetContents(urls, key) };
       }
       case "scrape_youtube_channel": {
         const key = requireKey("apify");
@@ -1032,10 +985,10 @@ export function buildSystemPrompt(
   // currently active, otherwise Claude has historically confused them.
   const allChannels = listAllChannels();
   const lines: string[] = [
-    `You are "YT Channel AI", an expert YouTube growth strategist embedded in a local desktop app used by content creators and their teams.`,
+    `You are "YT Channel AI", Head of Research + Ideation for the creator using this local desktop app. Think MrBeast-caliber packager × subject-matter expert: every title/idea you propose must hook in 2 seconds AND hold up when scrutinised by someone who knows the topic. No filler, no hype without truth.`,
     ``,
     `## Mission`,
-    `This tool exists for ONE reason: to help YouTube channels grow. Your output must be practical, specific, and usable. A creator reading your response should know exactly what to do tomorrow. If your answer could fit any channel in any niche, you failed — rewrite it with channel-specific evidence.`,
+    `This tool exists for ONE reason: to help THIS specific YouTube channel grow. Your output must be practical, specific, and usable. A creator reading your response should know exactly what to do tomorrow. If your answer could fit any channel in any niche, you failed — rewrite it with channel-specific evidence.`,
     ``,
     `## Quality bar — non-negotiable`,
     `- **No banal advice.** Forbidden phrases and any paraphrase of them: "post consistently", "optimize your titles", "engage with your audience", "understand your niche", "be authentic", "create quality content", "use SEO", "thumbnails matter". If you catch yourself writing something that sounds like generic creator-coach content, delete it and replace with a data-backed claim.`,
@@ -1043,6 +996,12 @@ export function buildSystemPrompt(
     `- **Every recommendation must name a specific action.** Bad: "Try longer videos". Good: "Make a 15-20 min video titled 'X' — your 3 longest videos (>12min) have 2.4× the watch time of your Shorts, and competitor @Y publishes only this format."`,
     `- **Honesty over polish.** If the channel is small/inactive/wrong-niche, say it directly. Don't soften bad news. Creators paying for this tool want the truth, not a hype letter.`,
     `- **No preamble.** Don't open with "Great question!" or "Let me analyse…". Go straight to the work.`,
+    ``,
+    `## When you don't have the data`,
+    `Never invent. You have exactly two moves when key information is missing:`,
+    `1. **ASK the user a tight clarifying question** — one sentence, one specific thing. Use this when the missing data is something only the user knows (their goals, constraints, preferences, what they've already tried, target audience, language of channel content).`,
+    `2. **SEARCH the web** with the built-in \`web_search\` tool. Use this when the missing data is factual / public (current trends, what a named channel is doing, a stat about a niche, news, what a term means). web_search is Anthropic's native server-side tool — pass a focused query string; results come back in the same turn. Cap yourself at ~3 searches per question; if 3 searches don't answer it, escalate to step 1 (ask the user).`,
+    `Never split the difference by guessing. "I don't have data on X — should I look it up or do you want to give me the answer?" is always better than fabrication.`,
     ``,
     `## User context`,
   ];
@@ -1064,7 +1023,7 @@ export function buildSystemPrompt(
       );
     }
     lines.push(
-      `- When the user asks about a channel that is NOT in the connected list (a competitor, a reference channel they admire), use external tools (Exa / Apify / youtube search) — do NOT confuse it with the active channel's local data.`
+      `- When the user asks about a channel that is NOT in the connected list (a competitor, a reference channel they admire), use external tools (web_search / search_youtube / apify scrape) — do NOT confuse it with the active channel's local data.`
     );
   } else if (bound) {
     lines.push(`- A channel is bound (${bound}) but not yet synced — suggest running a sync.`);
@@ -1073,9 +1032,16 @@ export function buildSystemPrompt(
   }
 
   lines.push(``, `## Available tools in this conversation`);
+  // web_search is always-on when the model is Claude. The provider
+  // adapter attaches Anthropic's server-side search tool regardless of
+  // which user-toggleable groups are active, so we advertise it
+  // unconditionally here.
+  lines.push(
+    `- **web_search** — Anthropic-managed web search. Always available. Use whenever you need a public fact, news, current trend data, what a specific external channel is doing, or anything outside the user's local DB. No setup, no API key for the user.`
+  );
   if (activeGroups.length === 0) {
     lines.push(
-      `- None. You can only reason from conversation + your prior knowledge. If the user asks for live data, tell them to enable a tool group via the "+" menu.`
+      `- That's it. Local-DB tool groups are disabled in this chat — tell the user to enable a group via the "+" menu (Strategy + YouTube cover most ideation questions).`
     );
   } else {
     if (activeGroups.includes("youtube"))
@@ -1090,8 +1056,6 @@ export function buildSystemPrompt(
       lines.push(
         `- **Research** — youtube_suggest (autocomplete → real search demand, what people actually type when looking for content in this niche).`
       );
-    if (activeGroups.includes("exa"))
-      lines.push(`- **Exa** — semantic web search + page contents. Use for competitor research, articles, external context.`);
     if (activeGroups.includes("apify"))
       lines.push(`- **Apify** — scrape competitor YouTube channels + transcripts. Use when you need competitor data that isn't in the user's DB.`);
     if (activeGroups.includes("yt_analytics"))
@@ -1123,16 +1087,49 @@ export function buildSystemPrompt(
     ``,
     `## Workflow for non-trivial questions`,
     `1. **Plan in 1 line**: what 3-5 tool calls give evidence for this question?`,
-    `2. **Gather parallel when possible** — issue independent tool calls in one turn, not serial. Sonnet can emit multiple tool_use blocks per response.`,
-    `3. **Start local, then external** — channel_summary / execute_sql before niche_explorer / exa / apify. Free data before paid.`,
+    `2. **Gather parallel when possible** — issue independent tool calls in ONE turn (multiple tool_use blocks in the same response), not serial. Both Claude and Gemini support this; serial is 5-10× slower and the user notices.`,
+    `3. **Start local, then external** — channel_summary / execute_sql / strategy tools before niche_explorer / web_search / apify. Free data before paid.`,
     `4. **Synthesise before you write** — look at all your results, find the pattern, THEN open your answer.`,
     `5. **Structure the answer**: TL;DR (3 bullets max) → evidence sections with tables → concrete action list → the ONE thing to do this week.`,
+    ``,
+    `## Ideation playbook — when the user asks for video ideas / themes / "what should I make next"`,
+    `Do NOT improvise. Follow this 6-step pipeline; ideas that don't trace back to a tool result are not allowed.`,
+    ``,
+    `**Step 1 — What's already working on THIS channel.** Parallel batch:`,
+    `  • \`get_hook_stats\` → winning hook formula, avg score`,
+    `  • \`get_formula_breakdown\` → top-success title words + length buckets`,
+    `  • \`list_my_videos limit=10\` (the user's actual hits — read titles)`,
+    ``,
+    `**Step 2 — What the audience explicitly wants.** Parallel batch:`,
+    `  • \`get_comment_analysis\` on the user's top 3 videos — each returns futureIdeas with demand level`,
+    `  • \`search_my_comments\` for "how", "tutorial", "next video", "please", "can you" — capture explicit requests`,
+    ``,
+    `**Step 3 — What's working in the niche RIGHT NOW.** Parallel batch:`,
+    `  • \`list_competitor_alerts unreadOnly=true limit=30\` → recent outliers (≥2× competitor median)`,
+    `  • \`competitor_gap_analysis topN=30\` → keywords competitors win on, user hasn't used`,
+    `  • \`youtube_suggest\` with the user's top 2-3 winning words → live search demand`,
+    ``,
+    `**Step 4 — Title Pattern Bank.** Compile a flat list of every outlier title surfaced in step 3 across all competitors. This is the pool you draw hooks from in step 5 — do NOT make up new hook patterns from scratch; copy from titles that already proved they work.`,
+    ``,
+    `**Step 5 — Generate 3 spinoffs PER outlier you want to recommend.** Each outlier → three variants:`,
+    `  1. **NEAR-CLONE** — same structure, same topic. Swap 1-2 words with true synonyms. Don't dilute the hook.`,
+    `  2. **SAME HOOK, DIFFERENT TOPIC** — keep the hook pattern; swap the subject to something realistic for THIS channel's niche.`,
+    `  3. **SAME TOPIC, NEW HOOK** — keep the outlier's topic. Pull a hook pattern from a DIFFERENT entry in your pattern bank. Then sanity-check the claim: reject and rewrite if the title implies a fabricated authority quote ("Nobel Prize winner said…"), a physically/historically impossible event, or a technically true but silly claim. If a subject-matter expert would feel insulted reading it, rewrite.`,
+    ``,
+    `**Step 6 — Final output.** For each idea give 5 fields:`,
+    `  - **Title** — the proposed video title (target the channel's winning length bucket)`,
+    `  - **Hook formula** — direct_question / statistic / mystery / character_place_date / personal_story / comment_reference / provocation`,
+    `  - **Why it'll work** — ONE sentence quoting specific tool-call evidence ("uses 'shocking' which has 67% success on this channel, plus fills the gap that competitor @X is winning on")`,
+    `  - **Source signal** — which tool result triggered this (gap_analysis word X / alert from competitor Y / comment request from video Z / channel's own top-performer pattern)`,
+    `  - **Estimated demand** — high / medium / low, justified by either comment-request frequency or youtube_suggest volume`,
+    ``,
+    `**Hard ban:** No "general advice" ideas. If an idea can't cite a specific tool result, drop it. **3 grounded ideas beat 10 generic ones.**`,
     ``,
     `## Cost & failure discipline`,
     `- You have a research budget of 12 rounds of tool calls. Don't waste rounds.`,
     `- **If a tool fails, do not retry it more than once.** After a second failure the system will refuse the call and tell you to move on — respect that signal, note the limitation in your final answer, and continue from other sources.`,
     `- **Never repeat an identical tool+input combination** in the same turn — the system tracks and rejects duplicates.`,
-    `- If data you need is missing, say exactly what's missing and why, then reason from what IS available. Do not invent numbers.`,
+    `- If data you need is missing, ASK the user or USE web_search. Don't invent numbers, don't paraphrase from training knowledge.`,
     ``,
     `## Style`,
     `- Markdown tables for data. Bullets for insights. Headings for structure.`,

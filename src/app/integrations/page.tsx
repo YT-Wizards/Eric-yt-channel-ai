@@ -14,7 +14,7 @@ import { ClaudeUsage } from "@/components/claude-usage";
 import { ApifyUsage } from "@/components/apify-usage";
 import { DeepgramUsage } from "@/components/deepgram-usage";
 
-type Name = "claude" | "deepgram" | "apify" | "exa" | "youtube" | "google_gemini";
+type Name = "claude" | "deepgram" | "apify" | "youtube" | "google_gemini";
 
 type StatusMap = Record<
   Name,
@@ -106,19 +106,6 @@ export default function IntegrationsPage() {
       },
     },
     {
-      name: "exa",
-      label: t.integrations.exa.name,
-      desc: t.integrations.exa.desc,
-      placeholder: t.integrations.exa.placeholder,
-      mode: "key",
-      help: {
-        title: t.integrations.exa.helpTitle,
-        steps: t.integrations.exa.helpSteps,
-        link: t.integrations.exa.helpLink,
-        linkLabel: t.integrations.exa.helpLinkLabel,
-      },
-    },
-    {
       name: "youtube",
       label: t.integrations.youtube.name,
       desc: t.integrations.youtube.desc,
@@ -153,8 +140,8 @@ export default function IntegrationsPage() {
     {
       title: "Optional add-ons",
       description:
-        "Add when you want the feature. Deepgram unlocks transcription for videos without YouTube captions. Apify is the competitor-sync fallback. Exa adds web search inside the AI Chat.",
-      names: ["deepgram", "apify", "exa"],
+        "Add when you want the feature. Deepgram unlocks transcription for videos without YouTube captions. Apify is the competitor-sync fallback when no YouTube Data API key is set. (Web search in the AI Chat is now built in — no extra key needed.)",
+      names: ["deepgram", "apify"],
     },
   ];
 

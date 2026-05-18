@@ -6,11 +6,15 @@ import { listIntegrations, setIntegration } from "@/lib/db";
 // land in SQLite. Apify is kept as an optional fallback for users who'd
 // rather not run yt-dlp on their machine (uses residential proxies on
 // Apify's side, no audio transit through this host).
+// "exa" was removed when we wired Claude's native web_search server tool
+// (see ai-provider.ts) — that obviates the third-party search key and a
+// duplicate "Web search" toggle in the chat. Existing exa rows in old
+// DBs are harmless; this list just stops accepting new ones and stops
+// surfacing them in the UI.
 const ALLOWED = [
   "claude",
   "deepgram",
   "apify",
-  "exa",
   "youtube",
   "google_gemini",
 ] as const;

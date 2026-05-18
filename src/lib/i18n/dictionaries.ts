@@ -284,15 +284,6 @@ type DictionaryShape = {
       helpLink: string;
       helpLinkLabel: string;
     };
-    exa: {
-      name: string;
-      desc: string;
-      placeholder: string;
-      helpTitle: string;
-      helpSteps: string[];
-      helpLink: string;
-      helpLinkLabel: string;
-    };
     youtube: {
       name: string;
       desc: string;
@@ -734,20 +725,6 @@ export const dictionaries: { en: DictionaryShape } = {
         ],
         helpLink: "https://console.apify.com/account/integrations",
         helpLinkLabel: "Open Apify Console",
-      },
-      exa: {
-        name: "Exa",
-        desc: "Semantic web search — Claude uses this to find articles, competitors, industry context outside YouTube.",
-        placeholder: "Your Exa API key",
-        helpTitle: "How to get an Exa API key",
-        helpSteps: [
-          "Sign up at exa.ai. New accounts get 1,000 free searches.",
-          "In the dashboard, find API Keys (top-right or sidebar). Create one.",
-          "Copy and paste below. Pricing after free tier: $5 per 1k neural searches — cheap for normal use.",
-          "When to enable: whenever the user asks about competitors by name, niche trends, or anything that requires live web context.",
-        ],
-        helpLink: "https://dashboard.exa.ai/api-keys",
-        helpLinkLabel: "Open Exa Dashboard",
       },
       youtube: {
         name: "YouTube Data API v3",
