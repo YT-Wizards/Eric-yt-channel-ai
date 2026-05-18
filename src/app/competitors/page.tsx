@@ -415,6 +415,22 @@ export default function CompetitorsPage() {
       {tab === "gaps" && (
         <Card>
           <CardContent className="p-4">
+            {/* High-visibility "what is this tab" explainer. Vlad's
+                feedback: nobody figures out Gap Analysis from the column
+                headings alone. */}
+            <div className="mb-4 flex items-start gap-3 rounded-md border border-primary/30 bg-primary/5 p-3 text-sm">
+              <TrendingUp className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+              <div>
+                <div className="font-medium">What is Gap Analysis?</div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  Keywords that competitors are getting views on but you&apos;ve
+                  never used in any of your titles. The longer the bar / higher
+                  the total views, the stronger the evidence that this word
+                  pulls traffic in your niche. Use the list as a shopping list
+                  for your next titles.
+                </div>
+              </div>
+            </div>
             {gaps.length === 0 ? (
               <div className="py-12 text-center text-sm text-muted-foreground">
                 No gaps detected yet. Add at least one competitor and sync to
@@ -467,6 +483,22 @@ export default function CompetitorsPage() {
       {tab === "alerts" && (
         <Card>
           <CardContent className="p-4">
+            {/* "What are these alerts?" callout. Vlad's feedback:
+                "Allorts це коли outlier появляється?" — yes, exactly,
+                but you wouldn't know that from the empty state alone. */}
+            <div className="mb-4 flex items-start gap-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+              <div>
+                <div className="font-medium">What are these alerts?</div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  Whenever a tracked competitor uploads a video that goes
+                  &ge;2× their own typical view count, it lands here as an
+                  &quot;outlier&quot;. These are the leading indicators of a
+                  trend or a working hook in your niche — open the video, see
+                  what they did differently, steal the format.
+                </div>
+              </div>
+            </div>
             {alerts.length === 0 ? (
               <div className="py-12 text-center text-sm text-muted-foreground">
                 No viral alerts yet. They appear automatically when a tracked
@@ -543,14 +575,18 @@ export default function CompetitorsPage() {
         </Card>
       )}
 
-      {/* Quick link to /integrations for users who don't have Apify set up */}
+      {/* Footnote pointing to /integrations. Backend: YouTube Data
+          API primary, Apify only as a fallback when no YT key is set
+          (or quota is exhausted). The old footer claimed "uses your
+          Apify integration" which is no longer accurate. */}
       <p className="mt-6 text-center text-[11px] text-muted-foreground">
         Competitor sync uses your{" "}
         <Link href="/integrations" className="text-primary hover:underline">
-          Apify integration
-        </Link>
-        . No Apify key → sync errors but everything else works (manual entry,
-        gap analysis on existing data).
+          YouTube Data API key
+        </Link>{" "}
+        (Apify is only a fallback if you haven&apos;t configured one). Gap
+        analysis and alerts keep working on already-synced data even if a
+        future sync fails.
       </p>
     </div>
   );

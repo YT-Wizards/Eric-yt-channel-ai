@@ -14,7 +14,16 @@ import {
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { HookAnalysisBanner } from "@/components/hook-analysis-banner";
+import {
+  PROVIDER_CHOICES,
+  providerLabel,
+  type ProviderChoice,
+} from "@/lib/ai-provider-types";
 import { cn } from "@/lib/utils";
+
+// localStorage key so the provider pick survives page reload — same
+// pattern used elsewhere for the chat-header model dropdown.
+const HOOK_PROVIDER_PREF = "yt-channel-ai.hooks.provider";
 
 type HookAnalysisJob = {
   id: number;
@@ -136,6 +145,25 @@ export default function HooksPage() {
   const [analyzingIds, setAnalyzingIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [orderBy, setOrderBy] = useState<"score" | "views" | "recent">("score");
+  // Which AI provider drives both batch + per-video re-analysis. Undefined
+  // means "let the server pick" (Claude if configured, else Gemini 2.5
+  // Pro) — that's the right default for users who only have one key.
+  // We restore the last picked provider from localStorage on mount so
+  // the choice survives reloads.
+  const [provider, setProvider] = useState<ProviderChoice | undefined>(
+    undefined
+  );
+  useEffect(() => {
+    const stored = window.localStorage.getItem(HOOK_PROVIDER_PREF);
+    if (stored && PROVIDER_CHOICES.includes(stored as ProviderChoice)) {
+      setProvider(stored as ProviderChoice);
+    }
+  }, []);
+  const updateProvider = (next: ProviderChoice | undefined) => {
+    setProvider(next);
+    if (next) window.localStorage.setItem(HOOK_PROVIDER_PREF, next);
+    else window.localStorage.removeItem(HOOK_PROVIDER_PREF);
+  };
 
   const refresh = useCallback(async () => {
     try {
@@ -168,7 +196,14 @@ export default function HooksPage() {
   const analyzeAllPending = async () => {
     setError(null);
     try {
-      const r = await fetch("/api/hooks/analyze-pending", { method: "POST" });
+      // Pass the picked provider so the batch runs on Claude or whichever
+      // Gemini variant the user selected. Empty body = server-side
+      // auto-resolve (Claude if configured, else Gemini 2.5 Pro).
+      const r = await fetch("/api/hooks/analyze-pending", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(provider ? { provider } : {}),
+      });
       const d = (await r.json()) as {
         ok?: boolean;
         jobId?: number;
@@ -210,7 +245,14 @@ export default function HooksPage() {
     setAnalyzingIds((prev) => new Set(prev).add(videoId));
     setError(null);
     try {
-      const r = await fetch(`/api/hooks/analyze/${videoId}`, { method: "POST" });
+      // Same provider threading as the batch endpoint — keeps the
+      // single-video Re-analyze button consistent with what the header
+      // picker says.
+      const r = await fetch(`/api/hooks/analyze/${videoId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(provider ? { provider } : {}),
+      });
       const d = (await r.json()) as { ok?: boolean; error?: string };
       if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
       await refresh();
@@ -270,23 +312,51 @@ export default function HooksPage() {
             strengths, suggested fixes.
           </p>
         </div>
-        <Button
-          onClick={analyzeAllPending}
-          disabled={analyzing || dashboard.pending === 0}
-          size="sm"
-          className="gap-1.5"
-        >
-          {analyzing ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Sparkles className="h-3.5 w-3.5" />
-          )}
-          {analyzing
-            ? "Analyzing…"
-            : dashboard.pending === 0
-              ? "All analyzed"
-              : `Analyze ${dashboard.pending} pending`}
-        </Button>
+        <div className="flex items-center gap-2">
+          {/* AI provider picker. "Auto" leaves the resolve to the server
+              (Claude if its key is set, else Gemini 2.5 Pro). Explicit
+              choices force a specific model — useful when both keys are
+              configured and the user wants to use Gemini for cost or
+              Claude for quality. Persists across reloads via
+              localStorage so a return visit doesn't snap back to Auto. */}
+          <select
+            value={provider ?? ""}
+            onChange={(e) =>
+              updateProvider(
+                e.target.value === ""
+                  ? undefined
+                  : (e.target.value as ProviderChoice)
+              )
+            }
+            disabled={analyzing}
+            className="h-9 rounded-md border border-input bg-background px-2 text-xs"
+            title="Which AI model scores the hooks. Auto = whichever key you've configured."
+          >
+            <option value="">Auto (recommended)</option>
+            {PROVIDER_CHOICES.map((p) => (
+              <option key={p} value={p}>
+                {providerLabel(p)}
+              </option>
+            ))}
+          </select>
+          <Button
+            onClick={analyzeAllPending}
+            disabled={analyzing || dashboard.pending === 0}
+            size="sm"
+            className="gap-1.5"
+          >
+            {analyzing ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Sparkles className="h-3.5 w-3.5" />
+            )}
+            {analyzing
+              ? "Analyzing…"
+              : dashboard.pending === 0
+                ? "All analyzed"
+                : `Analyze ${dashboard.pending} pending`}
+          </Button>
+        </div>
       </header>
 
       {/* Background-job banner: shows progress + cancel while a batch

@@ -7,7 +7,7 @@ import {
   Eye,
   Video,
   TrendingUp,
-  Upload,
+  Plug,
   Award,
   Flame,
   ChevronDown,
@@ -35,6 +35,7 @@ import { EditorBillingCard } from "@/components/editor-billing-card";
 import { TagsOverview } from "@/components/tags-overview";
 import { DashboardTabs } from "@/components/dashboard-tabs";
 import { AllChannelsOverview } from "@/components/all-channels-overview";
+import { useUiPref } from "@/lib/ui-prefs";
 import { cn } from "@/lib/utils";
 
 type Stats = {
@@ -88,6 +89,10 @@ export default function DashboardPage() {
   const [channel, setChannel] = useState<Channel | null>(null);
   const [aggregates, setAggregates] = useState<Aggregates | null>(null);
   const [expanded, setExpanded] = useState(false);
+  // Editor-billing widget is hidden by default — it only makes sense
+  // for users who actually pay an editor per video. Toggled via the
+  // Settings page (Optional sections → Editor billing card).
+  const [showEditorBilling] = useUiPref("showEditorBilling");
   // "all" = cross-channel summary view (selected via DashboardTabs);
   // "channel" = the existing single-channel dashboard. Defaults to
   // "channel" until DashboardTabs reads its persisted preference and
@@ -208,7 +213,7 @@ export default function DashboardPage() {
           <MultiChannelEarnings key={`mc-${refreshKey}`} />
           <TagsOverview key={`tg-${refreshKey}`} />
           <TodaysEarnings key={`te-${refreshKey}`} />
-          <EditorBillingCard key={`eb-${refreshKey}`} />
+          {showEditorBilling && <EditorBillingCard key={`eb-${refreshKey}`} />}
         </>
       )}
 
@@ -242,10 +247,13 @@ export default function DashboardPage() {
             <CardDescription>{t.dashboard.noData}</CardDescription>
           </CardHeader>
           <CardContent>
-            <Link href="/import">
+            {/* Empty-state CTA: bind a YouTube channel via the Integrations
+                page. CSV import was removed — local installs connect their
+                channel through the YouTube Data API binder instead. */}
+            <Link href="/integrations">
               <Button size="sm" className="gap-2">
-                <Upload className="h-4 w-4" />
-                {t.nav.import}
+                <Plug className="h-4 w-4" />
+                {t.nav.integrations}
               </Button>
             </Link>
           </CardContent>

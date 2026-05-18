@@ -1,5 +1,4 @@
 import "server-only";
-import Anthropic from "@anthropic-ai/sdk";
 import {
   HOOK_FORMULAS,
   type HookFormula,
@@ -8,11 +7,19 @@ import {
   getVideo,
   upsertVideoHook,
 } from "./db";
+import {
+  providerIntegrationName,
+  providerLabel,
+  providerModelId,
+  streamTurn,
+  type ProviderChoice,
+} from "./ai-provider";
 import { log } from "./logger";
 
 /**
  * AI-driven hook analysis. Pulls the first ~700 words (~60 seconds at
- * typical speech rate) from a video's transcript and asks Claude to:
+ * typical speech rate) from a video's transcript and asks the configured
+ * LLM (Claude or any Gemini variant) to:
  *
  *   1. Classify the hook into one of seven canonical formulas
  *      (direct_question, statistic, comment_reference, personal_story,
@@ -30,11 +37,15 @@ import { log } from "./logger";
  *      (mejoras) so the user gets actionable feedback per video.
  *
  * Output is strict JSON — we parse it and persist into the video_hooks
- * table. One call per video; batch endpoint handles the iteration so
- * we can rate-limit gently against Claude.
+ * table. One call per video; the batch endpoint handles the iteration so
+ * we can rate-limit gently against the upstream API.
+ *
+ * History: this module used to hardcode Anthropic Sonnet only. Vlad's
+ * feedback was that Eric (and other users on a Gemini-only setup) had
+ * no way to use Hook Lab. Now it routes through ai-provider.ts and
+ * accepts any of the same provider choices the chat header offers,
+ * with auto-fallback to whichever provider has a key configured.
  */
-
-const HOOK_ANALYZER_MODEL = "claude-sonnet-4-6";
 
 // Trim transcripts to roughly the first minute. Hook quality is about
 // what the viewer hears BEFORE they decide to keep watching — anything
@@ -106,9 +117,10 @@ type AnalyzerOutput = {
 };
 
 /**
- * Extract the longest plausible JSON object out of Claude's response.
- * We ask for strict JSON only, but Sonnet occasionally adds a stray
- * preamble or wraps in a code fence; defending against both is cheap.
+ * Extract the longest plausible JSON object out of the model's response.
+ * We ask for strict JSON only, but both Sonnet and Gemini occasionally
+ * add a stray preamble or wrap in a code fence; defending against both
+ * is cheap.
  */
 function extractJson(text: string): string {
   const fence = text.match(/```(?:json)?\s*\n([\s\S]+?)\n```/);
@@ -166,13 +178,46 @@ function validateOutput(parsed: unknown): AnalyzerOutput {
 }
 
 /**
+ * Resolve which provider to use for this analysis call.
+ *
+ *   - If the user passed an explicit provider, honor it (but bail
+ *     if its API key isn't configured).
+ *   - Otherwise prefer Claude when its key exists (the original
+ *     behaviour pre-Gemini), fall back to Gemini 2.5 Pro when only
+ *     Gemini is configured. The user can flip the explicit picker
+ *     in the Hook Lab header to override.
+ *
+ * Returns `null` if neither provider has a key — caller surfaces a
+ * clear "configure a key in Integrations" message.
+ */
+function resolveProvider(
+  explicit: ProviderChoice | undefined
+): { provider: ProviderChoice; apiKey: string } | null {
+  if (explicit) {
+    const key = getIntegration(providerIntegrationName(explicit))?.api_key;
+    if (!key) return null;
+    return { provider: explicit, apiKey: key };
+  }
+  const claudeKey = getIntegration("claude")?.api_key;
+  if (claudeKey) return { provider: "claude", apiKey: claudeKey };
+  const geminiKey = getIntegration("google_gemini")?.api_key;
+  if (geminiKey) return { provider: "gemini-2.5-pro", apiKey: geminiKey };
+  return null;
+}
+
+/**
  * Run hook analysis for a single video and persist the result. Re-runs
  * overwrite previous scores — the user can hit "Re-analyze" any time
  * to get fresh feedback (useful after a transcript correction or to
  * sanity-check a previous low score).
+ *
+ *   provider — optional ProviderChoice. When omitted, picks Claude if
+ *   its key is configured, else Gemini 2.5 Pro. The batch endpoint
+ *   threads the user's pick from the Hook Lab UI through here.
  */
 export async function analyzeVideoHook(
-  videoId: string
+  videoId: string,
+  provider?: ProviderChoice
 ): Promise<{ ok: true; overallScore: number } | { ok: false; reason: string }> {
   const video = getVideo(videoId);
   if (!video) return { ok: false, reason: "video not found" };
@@ -186,17 +231,25 @@ export async function analyzeVideoHook(
     return { ok: false, reason: "transcript too short for hook analysis" };
   }
 
-  const apiKey = getIntegration("claude")?.api_key;
-  if (!apiKey) {
-    return { ok: false, reason: "Claude API key not configured" };
+  const resolved = resolveProvider(provider);
+  if (!resolved) {
+    return {
+      ok: false,
+      reason:
+        "No AI provider configured. Add a Claude or Gemini API key in Integrations.",
+    };
   }
 
-  const client = new Anthropic({ apiKey });
   let raw: string;
   try {
-    const response = await client.messages.create({
-      model: HOOK_ANALYZER_MODEL,
-      max_tokens: 2048,
+    // streamTurn handles both Claude and Gemini through the same shape.
+    // We don't actually need streaming for hook analysis (it's batch
+    // and the output is JSON, not user-facing prose), so onText is a
+    // no-op — we read the accumulated text from result.content after
+    // the turn finishes.
+    const result = await streamTurn({
+      provider: resolved.provider,
+      apiKey: resolved.apiKey,
       system: SYSTEM_PROMPT,
       messages: [
         {
@@ -204,15 +257,28 @@ export async function analyzeVideoHook(
           content: `Video title: "${video.title}"\n\nHook text (first ~60 seconds of transcript):\n"""\n${hookText}\n"""\n\nReturn the JSON analysis now.`,
         },
       ],
+      tools: [],
+      maxTokens: 2048,
+      onText: () => {},
     });
-    raw = response.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+    raw = result.content
+      .filter((b): b is { type: "text"; text: string; citations: null } =>
+        b.type === "text"
+      )
       .map((b) => b.text)
       .join("");
+    if (!raw.trim()) {
+      return {
+        ok: false,
+        reason: `${providerLabel(resolved.provider)} returned an empty response`,
+      };
+    }
   } catch (e) {
     return {
       ok: false,
-      reason: `Claude call failed: ${e instanceof Error ? e.message : String(e)}`,
+      reason: `${providerLabel(resolved.provider)} call failed: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
     };
   }
 
@@ -223,6 +289,7 @@ export async function analyzeVideoHook(
   } catch (e) {
     log.warn("hooks", `Hook analyzer JSON parse failed for ${videoId}`, {
       raw: raw.slice(0, 500),
+      provider: resolved.provider,
       error: e instanceof Error ? e.message : String(e),
     });
     return {
@@ -255,7 +322,7 @@ export async function analyzeVideoHook(
     overall_score: Math.round(overallScore * 10) / 10,
     fortalezas: JSON.stringify(parsed.fortalezas),
     mejoras: JSON.stringify(parsed.mejoras),
-    analyzer_model: HOOK_ANALYZER_MODEL,
+    analyzer_model: providerModelId(resolved.provider),
     analyzed_at: Math.floor(Date.now() / 1000),
   });
 
@@ -263,6 +330,7 @@ export async function analyzeVideoHook(
     videoId,
     formula: parsed.formula_type,
     overallScore,
+    provider: resolved.provider,
   });
 
   return { ok: true, overallScore };

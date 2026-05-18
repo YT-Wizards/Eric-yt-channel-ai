@@ -5,7 +5,6 @@ type DictionaryShape = {
     videos: string;
     chat: string;
     integrations: string;
-    import: string;
     logs: string;
     settings: string;
   };
@@ -374,19 +373,6 @@ type DictionaryShape = {
     creditLimitLabel: string;
     recentTitle: string;
   };
-  import: {
-    title: string;
-    subtitle: string;
-    dropHint: string;
-    button: string;
-    processing: string;
-    success: string;
-    howTitle: string;
-    howDesc: string;
-    importBtn: string;
-    imported: string;
-    skipped: string;
-  };
   settings: {
     title: string;
     subtitle: string;
@@ -440,7 +426,6 @@ export const dictionaries: { en: DictionaryShape } = {
       videos: "Videos",
       chat: "AI Chat",
       integrations: "Integrations",
-      import: "Import",
       logs: "Logs",
       settings: "Settings",
     },
@@ -857,20 +842,6 @@ export const dictionaries: { en: DictionaryShape } = {
       remainingHint: "Remaining: {amount} (~{hours}h of audio)",
       creditLimitLabel: "Credit limit",
       recentTitle: "Recent transcriptions",
-    },
-    import: {
-      title: "Import",
-      subtitle: "Import your YouTube Studio CSV export",
-      dropHint: "Drop your YT Studio CSV here or click to browse",
-      button: "Select file",
-      processing: "Processing...",
-      success: "Imported successfully",
-      howTitle: "Import from YouTube Studio",
-      howDesc:
-        "1. Open YouTube Studio → Content.\n2. Click the 'Export' button (top right) and choose 'Google Sheets' or 'Comma-separated values'.\n3. Upload the downloaded CSV file below.",
-      importBtn: "Import",
-      imported: "{n} videos imported",
-      skipped: "{n} skipped",
     },
     youtube: {
       bindTitle: "Bind your channel",

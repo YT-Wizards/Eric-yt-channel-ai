@@ -7,7 +7,7 @@ import {
   Eye,
   ThumbsUp,
   MessageCircle,
-  Upload,
+  Plug,
   Clock,
   Sparkles,
   Calendar,
@@ -173,10 +173,13 @@ export default function VideosPage() {
         <Card>
           <CardContent className="flex flex-col items-center gap-3 p-10 text-center">
             <div className="text-sm text-muted-foreground">{t.videos.empty}</div>
-            <Link href="/import">
+            {/* CSV Import was removed — empty-state CTA now points to
+                the Integrations page where the user binds a YouTube
+                channel via the Data API. */}
+            <Link href="/integrations">
               <Button size="sm" className="gap-2">
-                <Upload className="h-4 w-4" />
-                {t.nav.import}
+                <Plug className="h-4 w-4" />
+                {t.nav.integrations}
               </Button>
             </Link>
           </CardContent>

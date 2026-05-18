@@ -8,6 +8,7 @@ import {
   updateHookAnalysisJob,
 } from "@/lib/db";
 import { analyzeVideoHook } from "@/lib/hook-analyzer";
+import { PROVIDER_CHOICES, type ProviderChoice } from "@/lib/ai-provider-types";
 import { log } from "@/lib/logger";
 
 export const runtime = "nodejs";
@@ -38,6 +39,14 @@ const DEFAULT_BATCH = 200;
 type PostBody = {
   /** Cap the batch size if you only want to dip your toe in. */
   limit?: number;
+  /**
+   * Which AI provider to use for scoring. Defaults to Claude when its
+   * key is configured, otherwise Gemini 2.5 Pro. The Hook Lab UI
+   * threads its dropdown value through here so the user can analyse
+   * with Gemini even when a Claude key exists (or just because Gemini
+   * is cheaper).
+   */
+  provider?: ProviderChoice;
 };
 
 export async function POST(req: Request) {
@@ -76,6 +85,14 @@ export async function POST(req: Request) {
     HARD_MAX_BATCH,
     Math.max(1, body.limit ?? DEFAULT_BATCH)
   );
+  // Validate the provider field. Anything outside the enum gets stripped
+  // and the analyzer falls back to its auto-resolve (Claude if available,
+  // else Gemini 2.5 Pro) — better than echoing back a 400 for a typo.
+  const provider: ProviderChoice | undefined =
+    typeof body.provider === "string" &&
+    PROVIDER_CHOICES.includes(body.provider as ProviderChoice)
+      ? (body.provider as ProviderChoice)
+      : undefined;
 
   // listVideosPendingHookAnalysis is now channel-scoped so this returns
   // only the active channel's "transcript present, no hook" videos.
@@ -95,43 +112,51 @@ export async function POST(req: Request) {
     jobId,
     channelId,
     videoCount: pending.length,
+    provider: provider ?? "auto",
   });
 
-  void runBatch(jobId, pending);
+  void runBatch(jobId, pending, provider);
 
   return NextResponse.json({ ok: true, jobId, total: pending.length });
 }
 
 /**
- * Recognise Claude errors that mean "stop the batch, fix the account":
+ * Recognise provider errors that mean "stop the batch, fix the account":
  * empty credit balance, bad API key, model-not-allowed, etc. These will
  * affect every subsequent video the same way, so there's no point
  * burning 40 round-trips to learn the same thing 40 times.
  *
- * Anthropic returns these as HTTP 400/401/403 with `error.type` of
- * `invalid_request_error`, `authentication_error`, `permission_error`,
- * or `billing_error`. analyzeVideoHook surfaces them inside the
- * `reason` string verbatim, so a substring check is the cheapest
- * reliable signal.
+ * Catches the canonical error-type strings from both vendors. Anthropic
+ * uses `invalid_request_error` / `authentication_error` / `permission_
+ * error` / `billing_error`. Google AI Studio returns variants like
+ * "API key not valid", "quota exceeded", and "permission denied".
+ * analyzeVideoHook surfaces all of these inside the `reason` string
+ * verbatim, so a substring check is the cheapest reliable signal.
  */
-function isFatalClaudeError(reason: string): boolean {
+function isFatalProviderError(reason: string): boolean {
   const r = reason.toLowerCase();
   return (
+    // Anthropic / Claude
     r.includes("credit balance is too low") ||
     r.includes("authentication_error") ||
     r.includes("invalid x-api-key") ||
     r.includes("permission_error") ||
     r.includes("billing_error") ||
     r.includes("invalid_request_error") ||
-    // analyzeVideoHook prefixes Claude errors with "Claude call failed"
-    // and the API key absence with this exact string:
-    r.includes("claude api key not configured")
+    // Google / Gemini
+    r.includes("api key not valid") ||
+    r.includes("permission denied") ||
+    r.includes("quota exceeded") ||
+    r.includes("api_key_invalid") ||
+    // analyzeVideoHook's own "no provider configured" message
+    r.includes("no ai provider configured")
   );
 }
 
 async function runBatch(
   jobId: number,
-  videos: Array<{ id: string; title: string }>
+  videos: Array<{ id: string; title: string }>,
+  provider: ProviderChoice | undefined
 ): Promise<void> {
   let done = 0;
   let failed = 0;
@@ -156,7 +181,7 @@ async function runBatch(
 
       updateHookAnalysisJob(jobId, { current_video_id: v.id });
       try {
-        const r = await analyzeVideoHook(v.id);
+        const r = await analyzeVideoHook(v.id, provider);
         if (r.ok) {
           done++;
         } else {
@@ -164,8 +189,8 @@ async function runBatch(
           lastError = r.reason;
           // Fail-fast on fatal-by-account errors (empty credits, bad key,
           // no model access). Trying the next 39 videos won't help and
-          // just spams Anthropic with 400s.
-          if (isFatalClaudeError(r.reason)) {
+          // just spams the upstream with 400s.
+          if (isFatalProviderError(r.reason)) {
             abortedReason = r.reason;
             break;
           }
@@ -177,7 +202,7 @@ async function runBatch(
           jobId,
           videoId: v.id,
         });
-        if (isFatalClaudeError(lastError)) {
+        if (isFatalProviderError(lastError)) {
           abortedReason = lastError;
           break;
         }

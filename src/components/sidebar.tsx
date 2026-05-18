@@ -8,7 +8,6 @@ import {
   Video,
   MessageSquare,
   Plug,
-  Upload,
   Settings,
   PlaySquare,
   ScrollText,
@@ -19,11 +18,16 @@ import {
   BookmarkPlus,
 } from "lucide-react";
 import { useI18n } from "@/lib/i18n/provider";
+import { useUiPref } from "@/lib/ui-prefs";
 import { cn } from "@/lib/utils";
 
 export function Sidebar() {
   const { t } = useI18n();
   const pathname = usePathname();
+  // Logs is a power-user surface (raw activity stream). Hidden by
+  // default to keep the sidebar approachable for non-technical users;
+  // toggled on via Settings → Optional sections.
+  const [showLogs] = useUiPref("showLogs");
   // Lightweight competitor-alerts badge. Polls every 60s so the user
   // notices viral hits in their niche without having to open the
   // Competitors page. Quiet failure — no badge if the fetch errors
@@ -74,8 +78,12 @@ export function Sidebar() {
     },
     { href: "/alerts", label: "Alerts", icon: Bell, badge: 0 },
     { href: "/integrations", label: t.nav.integrations, icon: Plug, badge: 0 },
-    { href: "/import", label: t.nav.import, icon: Upload, badge: 0 },
-    { href: "/logs", label: t.nav.logs, icon: ScrollText, badge: 0 },
+    // Logs entry is opt-in — only rendered when the Settings toggle
+    // flips `showLogs` on. The /logs route stays reachable by direct
+    // URL either way.
+    ...(showLogs
+      ? [{ href: "/logs", label: t.nav.logs, icon: ScrollText, badge: 0 }]
+      : []),
     { href: "/settings", label: t.nav.settings, icon: Settings, badge: 0 },
   ];
 

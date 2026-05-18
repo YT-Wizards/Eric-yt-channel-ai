@@ -120,10 +120,21 @@ export default function FormulaAnalyzerPage() {
       {/* ---- Title length ---- */}
       <Card>
         <CardContent className="p-4">
-          <h2 className="mb-3 flex items-center gap-1.5 text-sm font-semibold">
+          <h2 className="mb-2 flex items-center gap-1.5 text-sm font-semibold">
             <Ruler className="h-3.5 w-3.5" />
             Optimal title length
           </h2>
+          {/* Beginner-friendly explainer for the buckets — Vlad's feedback:
+              "шо це таке ≤8 / 17+ слів?". The buckets count the number of
+              WORDS in each title and average the views of all your videos
+              that fell in that bucket. Longer bar = a length that has
+              historically pulled bigger views on YOUR channel. */}
+          <p className="mb-3 text-[11px] text-muted-foreground">
+            Buckets count how many <strong>words</strong> are in each title.
+            We average the views of every video in each bucket — the longest
+            bar is the length that has pulled the most views on this channel.
+            Useful as a sanity check before titling your next video.
+          </p>
           {lengthBuckets && lengthBuckets.length > 0 ? (
             <ul className="space-y-1.5">
               {lengthBuckets.map((b) => (
@@ -154,13 +165,19 @@ export default function FormulaAnalyzerPage() {
       {/* ---- Word stats ---- */}
       <Card>
         <CardContent className="p-4">
-          <h2 className="mb-3 text-sm font-semibold">
+          <h2 className="mb-2 text-sm font-semibold">
             Title words — ranked by aggregate views
           </h2>
+          {/* Help block — explicitly names every column so non-technical
+              users don't have to guess. Vlad's feedback: people don't
+              read column headers, they read sentences. */}
           <p className="mb-3 text-[11px] text-muted-foreground">
-            Success rate = share of videos containing the word where views
-            ended up ≥ 1.5× channel median. Words used &lt; 2 times are
-            hidden.
+            Every word that appeared in &ge;2 of your video titles. <strong>Uses</strong> =
+            how many times you used the word; <strong>Avg views</strong> = average
+            views across videos that contained it; <strong>Success</strong> = share of
+            those videos that ended up &ge;1.5&times; your channel median (green =
+            consistent winner). Use this to see which of your own words
+            historically work.
           </p>
           {wordStats && wordStats.length > 0 ? (
             <div className="overflow-x-auto">
