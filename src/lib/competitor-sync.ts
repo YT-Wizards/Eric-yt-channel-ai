@@ -235,9 +235,16 @@ async function syncViaYouTubeApi(
     videosInserted++;
   }
 
+  // Persist channel-level metadata. resolveChannel already returned
+  // subscribers / avatar / handle — previously we dropped them on the
+  // floor here, which is why competitor cards showed "—" subs and a
+  // letter-placeholder avatar even after a successful sync.
   updateCompetitorAfterSync(competitor.id, {
     title: ch.title,
     channel_id: ch.id,
+    handle: ch.handle ?? competitor.handle,
+    subscriber_count: ch.subscribers,
+    avatar_url: ch.thumbnail,
     video_count: videosInserted,
   });
 
@@ -409,6 +416,10 @@ async function syncViaApify(
     videosInserted++;
   }
 
+  // Apify's video scraper doesn't return channel-level subscriber count
+  // or avatar — those fields stay whatever they were. The YouTube Data
+  // API path (preferred) fills them in properly; Apify is a quota
+  // fallback so this gap is acceptable.
   updateCompetitorAfterSync(competitor.id, {
     title: channelTitle,
     channel_id: resolvedChannelId,
