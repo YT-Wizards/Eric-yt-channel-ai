@@ -39,6 +39,8 @@ type NavItem = {
   label: string;
   icon: LucideIcon;
   badge: number;
+  /** Optional small text tag (e.g. "BETA") shown next to the label. */
+  tag?: string;
 };
 
 type NavSection = {
@@ -123,7 +125,16 @@ export function Sidebar() {
           icon: Search,
           badge: unreadAlerts,
         },
-        { href: "/alerts", label: "Alerts", icon: Bell, badge: 0 },
+        {
+          href: "/alerts",
+          label: "Alerts",
+          icon: Bell,
+          badge: 0,
+          // Flagged BETA — the alerts surface is still rough and needs
+          // more work; the tag sets expectations so users don't treat
+          // it as finished.
+          tag: "BETA",
+        },
       ],
     },
     {
@@ -188,6 +199,11 @@ export function Sidebar() {
                       >
                         <Icon className="h-4 w-4" />
                         <span className="flex-1">{item.label}</span>
+                        {item.tag && (
+                          <span className="rounded border border-muted-foreground/30 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
+                            {item.tag}
+                          </span>
+                        )}
                         {item.badge > 0 && (
                           <span className="rounded-full bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400">
                             {item.badge}
