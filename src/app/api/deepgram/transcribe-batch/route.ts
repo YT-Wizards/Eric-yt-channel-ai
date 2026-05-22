@@ -12,29 +12,19 @@ import {
   upsertTranscript,
   type TranscribeCandidate,
 } from "@/lib/db";
-import {
-  estimateCostCents,
-  fetchCaptionsViaYtDlp,
-  transcribeYouTubeVideo,
-} from "@/lib/deepgram";
-import { fetchTranscriptFree } from "@/lib/youtube";
+import { estimateCostCents, transcribeYouTubeVideo } from "@/lib/deepgram";
 import { log } from "@/lib/logger";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
-/** Default concurrency — safe for Deepgram trial/credit tier (5 concurrent).
- * Lets us do 3 in parallel → ~3x speedup over serial, with a comfortable
- * margin under the tier limit. Configurable via settings in future. */
-const DEFAULT_CONCURRENCY = 3;
-
 /**
- * Minimum character count for a free YouTube caption track to be
- * accepted instead of falling through to Deepgram. timedtext sometimes
- * returns a near-empty or truncated track; anything shorter than this
- * is treated as "no usable captions" and we transcribe properly.
+ * Concurrency = 1 — videos are transcribed strictly one after another.
+ * Deliberately serial: parallel yt-dlp downloads hammered the machine
+ * and tripped YouTube's bot detection faster. One at a time is slower
+ * but predictable and easier to reason about.
  */
-const MIN_FREE_CAPTION_CHARS = 120;
+const CONCURRENCY = 1;
 
 type OrderBy = "views" | "recent" | "oldest";
 
@@ -289,13 +279,12 @@ async function runBatch(
   apiKey: string,
   videos: { id: string; title: string; duration_seconds: number | null }[]
 ): Promise<void> {
-  // Simple queue + N workers pattern. Workers pull from the shared list by
-  // index, advance the shared counters, persist after each item so the UI
-  // polling sees live progress.
+  // Queue + worker pattern. With CONCURRENCY = 1 there's a single
+  // worker, so videos are transcribed strictly one after another.
+  // Progress is persisted after each item so the UI poll sees it move.
   let cursor = 0;
   let done = 0;
   let failed = 0;
-  let freeCaptionCount = 0; // videos done via free YouTube captions
   let costCentsTotal = 0;
   let lastError: string | null = null;
 
@@ -306,60 +295,18 @@ async function runBatch(
       const v = videos[i];
       updateTranscriptionJob(jobId, { current_video_id: v.id });
       try {
-        // ---- Fast path A: bare timedtext probe ----
-        // Deepgram is slow (yt-dlp pulls the whole audio track into
-        // RAM, then uploads it) and costs money. Most videos have
-        // YouTube captions, which are instant and free. Try the cheap
-        // bare-HTTP probe first.
-        let captioned = false;
-        try {
-          const free = await fetchTranscriptFree(v.id);
-          if (free && free.text.trim().length >= MIN_FREE_CAPTION_CHARS) {
-            upsertTranscript(v.id, free.text, free.language);
-            captioned = true;
-            freeCaptionCount++;
-            done++;
-          }
-        } catch {
-          // timedtext blocked / unavailable — fall through.
-        }
-
-        // ---- Fast path B: yt-dlp subtitle extraction ----
-        // The bare probe above is bot-blocked a lot. yt-dlp carries the
-        // bypasses and pulls the same caption tracks reliably — still
-        // free, still seconds (no audio download, no Deepgram). This
-        // tier is what saves a batch when path A returns nothing for
-        // every video.
-        if (!captioned) {
-          try {
-            const viaYtdlp = await fetchCaptionsViaYtDlp(v.id);
-            if (
-              viaYtdlp &&
-              viaYtdlp.text.trim().length >= MIN_FREE_CAPTION_CHARS
-            ) {
-              upsertTranscript(v.id, viaYtdlp.text, viaYtdlp.language);
-              captioned = true;
-              freeCaptionCount++;
-              done++;
-            }
-          } catch {
-            // No captions via yt-dlp either — fall through to Deepgram.
-          }
-        }
-
-        // ---- Slow path: Deepgram ----
-        if (!captioned) {
-          const result = await transcribeYouTubeVideo(v.id, apiKey);
-          upsertTranscript(v.id, result.text, result.language);
-          recordDeepgramUsage({
-            videoId: v.id,
-            durationSeconds: result.durationSeconds,
-            costCents: result.costCents,
-            model: result.model,
-          });
-          done++;
-          costCentsTotal += result.costCents;
-        }
+        // Single path: Deepgram. The caption fast-paths were removed —
+        // transcription goes through Deepgram only, one video at a time.
+        const result = await transcribeYouTubeVideo(v.id, apiKey);
+        upsertTranscript(v.id, result.text, result.language);
+        recordDeepgramUsage({
+          videoId: v.id,
+          durationSeconds: result.durationSeconds,
+          costCents: result.costCents,
+          model: result.model,
+        });
+        done++;
+        costCentsTotal += result.costCents;
       } catch (err) {
         failed++;
         lastError = err instanceof Error ? err.message : String(err);
@@ -379,7 +326,7 @@ async function runBatch(
     }
   };
 
-  const workers = Array.from({ length: DEFAULT_CONCURRENCY }, () => worker());
+  const workers = Array.from({ length: CONCURRENCY }, () => worker());
   try {
     await Promise.all(workers);
     updateTranscriptionJob(jobId, {
@@ -391,8 +338,6 @@ async function runBatch(
       jobId,
       done,
       failed,
-      freeCaptionCount,
-      deepgramCount: done - freeCaptionCount,
       costCents: costCentsTotal,
     });
   } catch (err) {
