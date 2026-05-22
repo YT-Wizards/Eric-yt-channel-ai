@@ -18,7 +18,6 @@ import {
   Loader2,
   AlertCircle,
   Mic,
-  RotateCw,
   BarChart3,
   Upload,
 } from "lucide-react";
@@ -106,12 +105,6 @@ export default function VideoDetailPage({ params }: { params: Promise<{ id: stri
   const [transcribing, setTranscribing] = useState(false);
   const [tcError, setTcError] = useState<string | null>(null);
   const [deepgramReady, setDeepgramReady] = useState<boolean | null>(null);
-  // Free-captions tier — separate spinner so the user can see which path
-  // is running. `captionsUnavailable` flips to true after a 404 from
-  // /captions; we use it to grey out the free button after we know YouTube
-  // has nothing for this video, so the user doesn't keep poking it.
-  const [fetchingCaptions, setFetchingCaptions] = useState(false);
-  const [captionsUnavailable, setCaptionsUnavailable] = useState(false);
 
   useEffect(() => {
     fetch("/api/integrations")
@@ -160,14 +153,8 @@ export default function VideoDetailPage({ params }: { params: Promise<{ id: stri
     }
   }, [id, loadDetail]);
 
-  // YouTube timedtext fetch. On 404 unavailable, hold onto the debug
-  // payload so the UI can expand it for power users to see what
-  // YouTube actually returned — way more useful than a vague
-  // "no captions" message when something IS clearly captioned on
-  // youtube.com but we can't pull it.
-  const [tcDebug, setTcDebug] = useState<unknown | null>(null);
-  // Upload / URL paths — independent state from the captions path so
-  // their spinners and errors don't interfere with each other.
+  // Upload / URL paths — independent state so their spinners and
+  // errors don't interfere with the main Deepgram transcribe path.
   const [uploading, setUploading] = useState(false);
   const [uploadingProgress, setUploadingProgress] = useState<number | null>(null);
   const [urlInput, setUrlInput] = useState("");
@@ -258,39 +245,6 @@ export default function VideoDetailPage({ params }: { params: Promise<{ id: stri
       setTranscribingUrl(false);
     }
   }, [id, urlInput, loadDetail]);
-
-  const fetchCaptions = useCallback(async () => {
-    setFetchingCaptions(true);
-    setTcError(null);
-    setTcDebug(null);
-    try {
-      const res = await fetch(`/api/videos/${id}/captions`, { method: "POST" });
-      const data = (await res.json().catch(() => ({}))) as {
-        ok?: boolean;
-        error?: string;
-        unavailable?: boolean;
-        debug?: unknown;
-      };
-      if (res.status === 404 && data.unavailable) {
-        setCaptionsUnavailable(true);
-        setTcError(
-          data.error ??
-            "YouTube did not return captions for this video through any probed language. See debug below for raw probe responses."
-        );
-        if (data.debug) setTcDebug(data.debug);
-        return;
-      }
-      if (!res.ok) {
-        if (data.debug) setTcDebug(data.debug);
-        throw new Error(data.error ?? `HTTP ${res.status}`);
-      }
-      await loadDetail();
-    } catch (e) {
-      setTcError(e instanceof Error ? e.message : "failed");
-    } finally {
-      setFetchingCaptions(false);
-    }
-  }, [id, loadDetail]);
 
   const tags = useMemo(() => {
     if (!detail?.video.tags) return [];
@@ -496,12 +450,8 @@ export default function VideoDetailPage({ params }: { params: Promise<{ id: stri
           }}
           transcribing={transcribing}
           tcError={tcError}
-          tcDebug={tcDebug}
           deepgramReady={deepgramReady}
           onTranscribe={transcribe}
-          fetchingCaptions={fetchingCaptions}
-          captionsUnavailable={captionsUnavailable}
-          onFetchCaptions={fetchCaptions}
           uploading={uploading}
           uploadingProgress={uploadingProgress}
           onUploadFile={uploadFile}
@@ -587,12 +537,8 @@ function TranscriptPanel({
   onCopy,
   transcribing,
   tcError,
-  tcDebug,
   deepgramReady,
   onTranscribe,
-  fetchingCaptions,
-  captionsUnavailable,
-  onFetchCaptions,
   uploading,
   uploadingProgress,
   onUploadFile,
@@ -613,12 +559,8 @@ function TranscriptPanel({
   onCopy: () => void;
   transcribing: boolean;
   tcError: string | null;
-  tcDebug: unknown | null;
   deepgramReady: boolean | null;
   onTranscribe: () => void;
-  fetchingCaptions: boolean;
-  captionsUnavailable: boolean;
-  onFetchCaptions: () => void;
   uploading: boolean;
   uploadingProgress: number | null;
   onUploadFile: (file: File) => void;
@@ -648,48 +590,16 @@ function TranscriptPanel({
         <CardContent className="space-y-4 p-8 text-center text-sm">
           <div className="text-muted-foreground">{t.videoDetail.noTranscript}</div>
 
-          {/*
-            Three ways to get a transcript (local-first ordering):
-              1. YouTube captions (free, via timedtext + Innertube). First try.
-              2. Deepgram (recommended for this local build). yt-dlp pulls audio
-                 into RAM on this machine, streams it to Deepgram, transcript
-                 lands in the local DB. Costs ≈$0.0043/min ($0.26/hour).
-              3. Apify fallback — useful if yt-dlp is blocked or you'd rather
-                 not run the binary locally; ≈$0.02 per video.
-          */}
+          {/* Transcription is Deepgram-only. yt-dlp pulls the audio into
+              RAM on this machine, streams it to Deepgram, the transcript
+              lands in the local DB. ~$0.0043/min. The upload / paste-URL
+              options below feed Deepgram audio without yt-dlp. */}
           <div className="flex flex-wrap items-center justify-center gap-2">
-            <Button
-              onClick={onFetchCaptions}
-              disabled={fetchingCaptions || captionsUnavailable}
-              size="sm"
-              variant={captionsUnavailable ? "outline" : "default"}
-              className="gap-2"
-            >
-              {fetchingCaptions ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Fetching captions…
-                </>
-              ) : (
-                <>
-                  <Sparkles className="h-4 w-4" />
-                  {captionsUnavailable
-                    ? "No captions on YouTube"
-                    : "Get YouTube captions"}
-                  {!captionsUnavailable && (
-                    <span className="ml-1 rounded bg-primary-foreground/15 px-1.5 py-0.5 text-[10px] font-mono">
-                      free
-                    </span>
-                  )}
-                </>
-              )}
-            </Button>
-            {deepgramReady && (
+            {deepgramReady ? (
               <Button
                 onClick={onTranscribe}
                 disabled={transcribing}
                 size="sm"
-                variant={captionsUnavailable ? "default" : "outline"}
                 className="gap-2"
               >
                 {transcribing ? (
@@ -709,41 +619,25 @@ function TranscriptPanel({
                   </>
                 )}
               </Button>
+            ) : (
+              <Link href="/integrations" className="text-sm text-primary hover:underline">
+                Add a Deepgram key in Integrations to enable transcription
+              </Link>
             )}
           </div>
 
           <p className="text-[11px] text-muted-foreground">
-            Free path tries YouTube&apos;s [CC] feed (~80% of videos work).
-            Deepgram path runs locally — yt-dlp grabs the audio, streams it
-            to Deepgram (≈$0.0043 / min), transcript lands in your local DB.
-            {deepgramReady === false && (
-              <>
-                {" "}
-                <Link href="/integrations" className="text-primary hover:underline">
-                  Add Deepgram key
-                </Link>{" "}
-                to enable transcription.
-              </>
-            )}
+            Transcription runs through Deepgram — yt-dlp grabs the audio,
+            streams it to Deepgram (≈$0.0043 / min), the transcript lands in
+            your local DB.
           </p>
 
-
           {tcError && (
-            <div className="mx-auto max-w-2xl space-y-2 text-left">
+            <div className="mx-auto max-w-2xl text-left">
               <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
                 <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                 <span>{tcError}</span>
               </div>
-              {tcDebug !== null && tcDebug !== undefined && (
-                <details className="rounded-md border border-border bg-muted/20 p-2 text-[11px]">
-                  <summary className="cursor-pointer select-none font-medium text-muted-foreground">
-                    Show technical details (probe responses)
-                  </summary>
-                  <pre className="mt-2 max-h-80 overflow-auto whitespace-pre-wrap break-all text-[10px] leading-relaxed text-muted-foreground">
-                    {JSON.stringify(tcDebug, null, 2)}
-                  </pre>
-                </details>
-              )}
             </div>
           )}
         </CardContent>
@@ -768,21 +662,6 @@ function TranscriptPanel({
           <Button variant="outline" size="sm" onClick={onCopy} className="gap-1.5">
             {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
             {copied ? t.videoDetail.copied : t.videoDetail.copy}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onFetchCaptions}
-            disabled={fetchingCaptions}
-            className="gap-1.5"
-            title="Re-fetch the transcript from YouTube captions"
-          >
-            {fetchingCaptions ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RotateCw className="h-3.5 w-3.5" />
-            )}
-            {fetchingCaptions ? "Fetching…" : "Re-fetch captions"}
           </Button>
           {deepgramReady && (
             <Button

@@ -31,7 +31,6 @@ import {
 import {
   fetchComments,
   fetchTrending,
-  fetchTranscriptFree,
   nicheExplorer,
   searchYouTube,
   youtubeSuggest,
@@ -217,19 +216,6 @@ const ANALYTICS_TOOLS: Tool[] = [
         maxChannels: { type: "number", default: 5, maximum: 10 },
       },
       required: ["topic"],
-    },
-  },
-  {
-    name: "fetch_transcript",
-    description:
-      "Fetch the transcript of a YouTube video (any public video with captions — manual or auto). Free, no API key. Caches result in local DB if the video is already known.",
-    input_schema: {
-      type: "object",
-      properties: {
-        videoId: { type: "string", description: "YouTube 11-char video ID." },
-        lang: { type: "string", description: "Preferred language code (en, uk, ...)" },
-      },
-      required: ["videoId"],
     },
   },
 ];
@@ -681,25 +667,6 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
           data: await nicheExplorer(topic, key, { maxChannels }),
         };
       }
-      case "fetch_transcript": {
-        const videoId = String(input.videoId ?? "").trim();
-        if (!videoId) return { ok: false, error: "videoId required" };
-        const lang = typeof input.lang === "string" ? input.lang : undefined;
-        const cached = getTranscript(videoId);
-        if (cached) {
-          return {
-            ok: true,
-            data: { videoId, language: cached.language, text: cached.text.slice(0, 20_000), cached: true },
-          };
-        }
-        const t = await fetchTranscriptFree(videoId, { lang });
-        if (!t) return { ok: false, error: "no transcript available" };
-        upsertTranscript(videoId, t.text, t.language);
-        return {
-          ok: true,
-          data: { videoId, language: t.language, text: t.text.slice(0, 20_000), cached: false },
-        };
-      }
       case "youtube_suggest": {
         const query = String(input.query ?? "").trim();
         if (!query) return { ok: false, error: "query required" };
@@ -1095,7 +1062,7 @@ export function buildSystemPrompt(
       );
     }
     lines.push(
-      `- When the user asks about a channel that is NOT in their connected list (a competitor, a reference channel they admire), reach for external tools: \`scrape_youtube_channel\` (Apify), \`search_youtube\`, \`fetch_transcript\`, or \`web_search\`. Don't confuse it with the active channel's local data.`
+      `- When the user asks about a channel that is NOT in their connected list (a competitor, a reference channel they admire), reach for external tools: \`scrape_youtube_channel\` (Apify), \`search_youtube\`, or \`web_search\`. Don't confuse it with the active channel's local data.`
     );
   } else if (bound) {
     lines.push(`- A channel is bound (\`${bound}\`) but hasn't been synced yet. Suggest running a sync from Integrations → YouTube Channel before any deep analysis.`);
@@ -1142,7 +1109,6 @@ export function buildSystemPrompt(
     `- **\`search_youtube\`** *(query, type: video|channel, maxResults)* — public YouTube search. Costs 100 units; use sparingly.`,
     `- **\`youtube_trending\`** *(regionCode, categoryId, maxResults)* — what's trending on YouTube right now by region. 1 unit. Good for spotting format / topic patterns.`,
     `- **\`niche_explorer\`** *(topic, maxChannels)* — given a niche phrase, returns top-5 channels by subs + top-10 outlier videos (highest views in last 6 months). Costs ~200 units. Use ONCE per niche question, not per video.`,
-    `- **\`fetch_transcript\`** *(videoId, optional lang)* — public YouTube transcript for ANY video (manual or auto captions). Free, no key needed. Caches into local DB if the video is already known.`,
     `- **\`youtube_suggest\`** *(query, hl, gl)* — YouTube search autocomplete (what people actually type when searching). Free, no key. Excellent live-demand signal for ideation.`,
     ``,
     `## YouTube Analytics — Studio-grade data (needs Google OAuth)`,

@@ -7,13 +7,11 @@ import {
   recordCompetitorAlert,
   updateCompetitorAfterSync,
   upsertCompetitorComments,
-  upsertCompetitorTranscript,
   upsertCompetitorVideo,
   type Competitor,
 } from "./db";
 import {
   fetchCommentThreads,
-  fetchTranscriptFree,
   fetchVideos,
   listUploadIds,
   resolveChannel,
@@ -248,25 +246,10 @@ async function syncViaYouTubeApi(
     video_count: videosInserted,
   });
 
-  // 4. Captions via timedtext (FREE — not part of YT Data API quota).
-  //    Best-effort: silently skip videos that don't expose captions.
-  let transcriptsSaved = 0;
-  for (const v of videos) {
-    try {
-      const t = await fetchTranscriptFree(v.id);
-      if (t && t.text.trim().length > 50) {
-        upsertCompetitorTranscript(competitor.id, v.id, t.text, t.language);
-        transcriptsSaved++;
-      }
-    } catch {
-      // Per-video timedtext probe failure is normal and shouldn't kill
-      // the sync. We just move on.
-    }
-    // Mild pacing so we don't hammer Google with parallel timedtext
-    // requests (the endpoint isn't rate-limited per se but bursts can
-    // get throttled).
-    await new Promise((r) => setTimeout(r, 80));
-  }
+  // Competitor transcripts are no longer fetched — the free timedtext
+  // path was removed platform-wide. Competitor sync keeps metadata +
+  // comments only.
+  const transcriptsSaved = 0;
 
   // 5. Top comments per video (1 unit per video — biggest quota chunk).
   //    If the quota runs out mid-loop we bail out gracefully without

@@ -5,19 +5,16 @@ import {
   getActiveTranscriptionJob,
   getIntegration,
   getSetting,
-  getTranscript,
   listChannelVideosForCommentSync,
   setActiveChannelId,
   setSetting,
   updateCommentSyncJob,
   upsertChannel,
   upsertComments,
-  upsertTranscript,
   upsertVideo,
 } from "@/lib/db";
 import {
   fetchCommentThreads,
-  fetchTranscriptFree,
   fetchVideos,
   listUploadIds,
   resolveChannel,
@@ -254,47 +251,19 @@ export async function POST(req: Request) {
           saved++;
         }
 
-        // Phase 4: auto-fetch transcripts (free path, serial with small delay to avoid throttling)
-        send({ type: "status", step: "transcripts", message: "Fetching transcripts…" });
-        let transcriptsSaved = 0;
-        let transcriptsFailed = 0;
-        for (let i = 0; i < videos.length; i++) {
-          const v = videos[i];
-          if (getTranscript(v.id)) continue; // skip already cached
-          try {
-            const t = await fetchTranscriptFree(v.id);
-            if (t) {
-              upsertTranscript(v.id, t.text, t.language);
-              transcriptsSaved++;
-            } else {
-              transcriptsFailed++;
-            }
-          } catch {
-            transcriptsFailed++;
-          }
-          if (i % 5 === 0) {
-            send({
-              type: "progress",
-              phase: "transcripts",
-              count: transcriptsSaved,
-              total: videos.length,
-            });
-          }
-          // Gentle pacing
-          await new Promise((r) => setTimeout(r, 150));
-        }
+        // Transcripts are NOT auto-fetched during sync anymore.
+        // Transcription is Deepgram-only and explicit — the user runs it
+        // from the Videos page (bulk) or a video's Transcript tab.
 
         send({
           type: "done",
           saved,
           total: ids.length,
-          transcripts: { saved: transcriptsSaved, failed: transcriptsFailed },
         });
         log.info("sync", "Sync completed", {
           channelId: ch.id,
           videosSaved: saved,
           idsListed: ids.length,
-          transcripts: { saved: transcriptsSaved, failed: transcriptsFailed },
           durationMs: Date.now() - startedAt,
         });
 

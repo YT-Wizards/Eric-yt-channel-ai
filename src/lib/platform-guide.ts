@@ -255,8 +255,9 @@ instructions.
 - **Core** — YouTube Data API key (required to sync a channel),
   Claude and/or Gemini key (required for AI features). The user needs
   YouTube + at least one AI key.
-- **Optional add-ons** — Deepgram (transcription for videos without
-  YouTube captions), Apify (competitor-scrape fallback).
+- **Optional add-ons** — Deepgram (the transcription engine — required
+  if you want video transcripts at all), Apify (competitor-scrape
+  fallback).
 - **Advanced** — Google OAuth, collapsed by default. Connects YouTube
   Analytics for Studio-grade data (retention, traffic, revenue).
 
