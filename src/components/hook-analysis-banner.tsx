@@ -40,8 +40,18 @@ type HookAnalysisJob = {
  */
 export function HookAnalysisBanner({
   onJobChange,
+  pollSignal,
 }: {
   onJobChange?: (job: HookAnalysisJob | null) => void;
+  /**
+   * Bumped by the parent page right after it POSTs a new analysis
+   * batch. Without this the banner only ever learns about a job at
+   * mount time — so clicking "Analyze pending" started the job on the
+   * server but the banner (still holding job=null) never began polling
+   * and showed nothing until a full page reload re-mounted it. Any
+   * change to this number forces an immediate re-read of /jobs/latest.
+   */
+  pollSignal?: number;
 }) {
   const [job, setJob] = useState<HookAnalysisJob | null>(null);
   const [dismissed, setDismissed] = useState(false);
@@ -58,9 +68,12 @@ export function HookAnalysisBanner({
     }
   }, [onJobChange]);
 
+  // Re-read on mount AND whenever the parent bumps pollSignal (i.e.
+  // right after a new batch is kicked off). Picking up the fresh
+  // running job here is what lets the polling effect below start.
   useEffect(() => {
     loadLatest();
-  }, [loadLatest]);
+  }, [loadLatest, pollSignal]);
 
   // Reset the "user dismissed the completion summary" flag whenever a
   // new job kicks off — otherwise the next batch's completion summary

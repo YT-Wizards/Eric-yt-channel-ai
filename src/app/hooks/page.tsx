@@ -145,6 +145,10 @@ export default function HooksPage() {
   const [analyzingIds, setAnalyzingIds] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [orderBy, setOrderBy] = useState<"score" | "views" | "recent">("score");
+  // Bumped right after a batch is kicked off so HookAnalysisBanner
+  // immediately re-reads /jobs/latest and starts polling — otherwise it
+  // wouldn't notice the new job until a full page reload.
+  const [analyzeSignal, setAnalyzeSignal] = useState(0);
   // Which AI provider drives both batch + per-video re-analysis. Undefined
   // means "let the server pick" (Claude if configured, else Gemini 2.5
   // Pro) — that's the right default for users who only have one key.
@@ -211,8 +215,11 @@ export default function HooksPage() {
         error?: string;
       };
       if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
-      // Banner will pick the new job up on its next poll. Refresh
-      // dashboard so the "Pending" count is fresh too.
+      // Tell the banner to re-read /jobs/latest NOW so it sees the
+      // freshly-created running job and starts its progress polling.
+      // Without this the banner stays at job=null until a page reload.
+      setAnalyzeSignal((s) => s + 1);
+      // Refresh dashboard so the "Pending" count is fresh too.
       await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "failed");
@@ -362,7 +369,10 @@ export default function HooksPage() {
       {/* Background-job banner: shows progress + cancel while a batch
           is in flight, completion summary afterwards. Pushes the
           running-job state up so the header button stays disabled. */}
-      <HookAnalysisBanner onJobChange={handleJobChange} />
+      <HookAnalysisBanner
+        onJobChange={handleJobChange}
+        pollSignal={analyzeSignal}
+      />
 
       {/* Tabs */}
       <div className="mb-4 flex gap-4 border-b border-border">
