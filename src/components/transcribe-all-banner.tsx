@@ -197,9 +197,27 @@ export function TranscribeAllBanner() {
     const ok = finishedJob.done;
     const bad = finishedJob.failed;
     const spent = (finishedJob.cost_cents / 100).toFixed(2);
+    // When everything (or most of it) failed, the summary should show
+    // WHY — otherwise "14 failed" is an unactionable dead end. last_error
+    // holds the most recent per-video failure message.
+    const allFailed = bad > 0 && ok === 0;
     return (
-      <div className="mb-4 flex items-start gap-3 rounded-lg border border-border bg-green-500/5 p-3 text-sm">
-        <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-green-600 dark:text-green-400" />
+      <div
+        className={cn(
+          "mb-4 flex items-start gap-3 rounded-lg border p-3 text-sm",
+          allFailed
+            ? "border-destructive/40 bg-destructive/5"
+            : "border-border bg-green-500/5"
+        )}
+      >
+        <Sparkles
+          className={cn(
+            "mt-0.5 h-4 w-4 shrink-0",
+            allFailed
+              ? "text-destructive"
+              : "text-green-600 dark:text-green-400"
+          )}
+        />
         <div className="flex-1">
           <div className="font-medium">
             {t.deepgram.doneTitle}: {ok} / {finishedJob.total}
@@ -212,6 +230,26 @@ export function TranscribeAllBanner() {
           <div className="mt-0.5 text-xs text-muted-foreground">
             {t.deepgram.doneSpent.replace("{amount}", `$${spent}`)}
           </div>
+          {/* Surface the actual failure reason. Without this the user
+              just sees "N failed" and has to dig through /logs. */}
+          {bad > 0 && finishedJob.last_error && (
+            <div className="mt-1.5 rounded border border-destructive/30 bg-destructive/5 px-2 py-1.5 text-xs text-destructive">
+              <span className="font-medium">Why it failed: </span>
+              {finishedJob.last_error}
+            </div>
+          )}
+          {allFailed && (
+            <div className="mt-1.5 text-xs text-muted-foreground">
+              Every video failed and nothing was charged — this is a
+              setup problem, not a per-video glitch. Most common cause:
+              yt-dlp can&apos;t reach YouTube. Check{" "}
+              <a href="/logs" className="text-primary hover:underline">
+                Logs
+              </a>{" "}
+              for the full error, or paste a YouTube cookies.txt under
+              Integrations → YouTube cookies.
+            </div>
+          )}
         </div>
         <button
           onClick={() => setDismissed(true)}
