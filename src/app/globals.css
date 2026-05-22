@@ -4,6 +4,10 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
+  /* Tells the browser to render native UI (the popup list of a
+     <select>, scrollbars, date pickers, the autofill dropdown) in the
+     light variant. Without this the OS default leaks through. */
+  color-scheme: light;
   --background: 0 0% 100%;
   --foreground: 222 47% 11%;
   --card: 0 0% 100%;
@@ -30,6 +34,11 @@
 }
 
 .dark {
+  /* Dark-variant native UI — this is what makes a <select>'s dropdown
+     list render dark instead of the OS-default white-on-black mismatch
+     that looked broken against the dark page. Also fixes scrollbars
+     and any other native control. */
+  color-scheme: dark;
   --background: 222 47% 7%;
   --foreground: 210 40% 98%;
   --card: 222 47% 9%;
