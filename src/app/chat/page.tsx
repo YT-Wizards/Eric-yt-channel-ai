@@ -255,31 +255,28 @@ function ChatPageInner() {
       .then((d) => {
         const ints = d.integrations ?? null;
         setIntegrations(ints);
-        // Auto-enable every tool group whose required integration is set up.
-        // Without this the AI starts blind — questions like "analyse my
-        // comments" returned generic answers because Sonnet didn't even know
-        // the comment tools existed in the conversation. User can still
-        // disable individual groups via the "+" menu, and we don't override
-        // their choice if they've already toggled anything this page-load.
+        // Auto-enable EVERY tool group on every fresh session, regardless
+        // of which API keys are set. The system prompt teaches the model
+        // how to surface "you haven't configured X — go to Integrations
+        // → X" cleanly when a tool comes back with a key-not-found
+        // error, so the worst case of pre-enabling a key-less group is
+        // one polite redirect instead of a hidden capability. The best
+        // case (and far more common) is the user discovering they CAN
+        // ask about competitors / studio analytics / outliers without
+        // having to dig through a "+" menu first.
+        //
+        // We still respect a non-empty prior state so manual toggles
+        // earlier in the page-load aren't stomped on.
         setActiveTools((prev) => {
           if (prev.size > 0) return prev;
-          const defaults = new Set<ToolGroup>();
-          defaults.add("yt_analytics"); // surfaces a clear "not connected" if OAuth missing
-          defaults.add("research"); // youtube_suggest is keyless
-          // Strategy reads everything this app already computed — no
-          // external dependency. On by default so the AI immediately
-          // knows about hooks, competitors, gap analysis, etc.
-          defaults.add("strategy");
-          if (ints?.youtube?.hasKey) {
-            defaults.add("youtube");
-            defaults.add("analytics");
-            // "research" is youtube_suggest only — same API key, free.
-            // Enabling it by default gets the model live search-demand
-            // data when planning ideas without an extra toggle.
-            defaults.add("research");
-          }
-          if (ints?.apify?.hasKey) defaults.add("apify");
-          return defaults;
+          return new Set<ToolGroup>([
+            "youtube",
+            "analytics",
+            "research",
+            "apify",
+            "yt_analytics",
+            "strategy",
+          ]);
         });
       })
       .catch(() => setIntegrations({} as IntegrationsStatus));
