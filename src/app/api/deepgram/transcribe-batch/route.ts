@@ -13,6 +13,7 @@ import {
   type TranscribeCandidate,
 } from "@/lib/db";
 import { estimateCostCents, transcribeYouTubeVideo } from "@/lib/deepgram";
+import { fetchTranscriptFree } from "@/lib/youtube";
 import { log } from "@/lib/logger";
 
 export const runtime = "nodejs";
@@ -22,6 +23,14 @@ export const maxDuration = 300;
  * Lets us do 3 in parallel → ~3x speedup over serial, with a comfortable
  * margin under the tier limit. Configurable via settings in future. */
 const DEFAULT_CONCURRENCY = 3;
+
+/**
+ * Minimum character count for a free YouTube caption track to be
+ * accepted instead of falling through to Deepgram. timedtext sometimes
+ * returns a near-empty or truncated track; anything shorter than this
+ * is treated as "no usable captions" and we transcribe properly.
+ */
+const MIN_FREE_CAPTION_CHARS = 120;
 
 type OrderBy = "views" | "recent" | "oldest";
 
@@ -282,6 +291,7 @@ async function runBatch(
   let cursor = 0;
   let done = 0;
   let failed = 0;
+  let freeCaptionCount = 0; // videos done via free YouTube captions
   let costCentsTotal = 0;
   let lastError: string | null = null;
 
@@ -292,16 +302,38 @@ async function runBatch(
       const v = videos[i];
       updateTranscriptionJob(jobId, { current_video_id: v.id });
       try {
-        const result = await transcribeYouTubeVideo(v.id, apiKey);
-        upsertTranscript(v.id, result.text, result.language);
-        recordDeepgramUsage({
-          videoId: v.id,
-          durationSeconds: result.durationSeconds,
-          costCents: result.costCents,
-          model: result.model,
-        });
-        done++;
-        costCentsTotal += result.costCents;
+        // ---- Fast path: free YouTube captions ----
+        // Deepgram is slow (yt-dlp pulls the whole audio track into
+        // RAM, then uploads it) and costs money. The overwhelming
+        // majority of videos already have YouTube auto-captions, which
+        // are instant and free. Try those FIRST; only pay for Deepgram
+        // when a video genuinely has no usable caption track.
+        let captioned = false;
+        try {
+          const free = await fetchTranscriptFree(v.id);
+          if (free && free.text.trim().length >= MIN_FREE_CAPTION_CHARS) {
+            upsertTranscript(v.id, free.text, free.language);
+            captioned = true;
+            freeCaptionCount++;
+            done++;
+          }
+        } catch {
+          // timedtext blocked / unavailable — fall through to Deepgram.
+        }
+
+        // ---- Slow path: Deepgram ----
+        if (!captioned) {
+          const result = await transcribeYouTubeVideo(v.id, apiKey);
+          upsertTranscript(v.id, result.text, result.language);
+          recordDeepgramUsage({
+            videoId: v.id,
+            durationSeconds: result.durationSeconds,
+            costCents: result.costCents,
+            model: result.model,
+          });
+          done++;
+          costCentsTotal += result.costCents;
+        }
       } catch (err) {
         failed++;
         lastError = err instanceof Error ? err.message : String(err);
@@ -333,6 +365,8 @@ async function runBatch(
       jobId,
       done,
       failed,
+      freeCaptionCount,
+      deepgramCount: done - freeCaptionCount,
       costCents: costCentsTotal,
     });
   } catch (err) {

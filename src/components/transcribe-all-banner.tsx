@@ -228,6 +228,18 @@ export function TranscribeAllBanner() {
   if (job && job.status === "running") {
     const pct = job.total > 0 ? (job.done / job.total) * 100 : 0;
     const spent = (job.cost_cents / 100).toFixed(2);
+    // Elapsed since the batch started. Re-computed on every poll tick
+    // (every 2s) so the user always sees a moving number — proof the
+    // job is alive even while done is still 0 (the first few videos can
+    // each take a couple of minutes to download + transcribe).
+    const elapsedSec = Math.max(
+      0,
+      Math.floor(Date.now() / 1000) - job.started_at
+    );
+    const elapsed =
+      elapsedSec < 60
+        ? `${elapsedSec}s`
+        : `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`;
     const cancelJob = async () => {
       if (!confirm("Stop the running transcribe batch? The video currently in flight finishes; everything queued behind it gets skipped.")) return;
       try {
@@ -253,6 +265,9 @@ export function TranscribeAllBanner() {
             )}
           </span>
           <div className="flex items-center gap-3">
+            <span className="text-xs tabular-nums text-muted-foreground">
+              {elapsed} elapsed
+            </span>
             <span className="text-xs text-muted-foreground">
               {t.deepgram.spentSoFar.replace("{amount}", `$${spent}`)}
             </span>
@@ -274,9 +289,25 @@ export function TranscribeAllBanner() {
             style={{ width: `${pct.toFixed(1)}%` }}
           />
         </div>
-        <p className="text-xs text-muted-foreground">
-          {t.deepgram.runningHint}
-        </p>
+        {/* When done is still 0 the bar sits at 0% and looks frozen —
+            reassure the user it's actually working. The first videos
+            are the slow ones (audio download + Deepgram per video). */}
+        {job.done === 0 ? (
+          <p className="text-xs text-muted-foreground">
+            Working on the first videos. Each one is checked for free
+            YouTube captions (instant) and only sent to Deepgram if it
+            has none — that part takes a minute or two per video. The
+            counter moves as videos complete; you can leave this page,
+            it keeps running.
+          </p>
+        ) : (
+          <p className="text-xs text-muted-foreground">
+            {job.current_video_id
+              ? `Currently transcribing video ${job.current_video_id}. `
+              : ""}
+            Runs in the background — you can leave this page.
+          </p>
+        )}
       </div>
     );
   }
