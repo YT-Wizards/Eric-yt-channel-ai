@@ -190,15 +190,40 @@ export default function CompetitorsPage() {
   const syncAll = async () => {
     setSyncingAll(true);
     setError(null);
+    const startedAt = Math.floor(Date.now() / 1000);
     try {
       const r = await fetch("/api/competitors/sync-all", { method: "POST" });
       if (!r.ok) {
         const d = (await r.json().catch(() => ({}))) as { error?: string };
         throw new Error(d.error ?? `HTTP ${r.status}`);
       }
-      await refresh();
-      await refreshAlerts();
-      await refreshGaps();
+      // The endpoint is fire-and-forget now — it returns instantly and
+      // syncs competitors in the background. Poll the list every few
+      // seconds so cards refresh as each competitor finishes. Stop once
+      // every competitor's last_sync_at is newer than when we started,
+      // or after a hard 3-minute ceiling so the button can't spin
+      // forever if a competitor sync errors before stamping its time.
+      const deadline = Date.now() + 3 * 60 * 1000;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        await new Promise((res) => setTimeout(res, 4000));
+        let list: { competitors: Competitor[]; unreadAlerts: number };
+        try {
+          const listRes = await fetch("/api/competitors", { cache: "no-store" });
+          list = (await listRes.json()) as typeof list;
+        } catch {
+          if (Date.now() > deadline) break;
+          continue;
+        }
+        setCompetitors(list.competitors);
+        setUnread(list.unreadAlerts);
+        refreshAlerts();
+        refreshGaps();
+        const allFresh =
+          list.competitors.length > 0 &&
+          list.competitors.every((c) => (c.last_sync_at ?? 0) >= startedAt);
+        if (allFresh || Date.now() > deadline) break;
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "sync failed");
     } finally {
@@ -433,8 +458,30 @@ export default function CompetitorsPage() {
             </div>
             {gaps.length === 0 ? (
               <div className="py-12 text-center text-sm text-muted-foreground">
-                No gaps detected yet. Add at least one competitor and sync to
-                surface keywords you&apos;re missing.
+                {competitors.length === 0 ? (
+                  // Genuinely no competitors yet.
+                  <>
+                    No competitors tracked yet. Add at least one rival channel
+                    on the Overview tab and sync it — this fills with keywords
+                    you&apos;re missing.
+                  </>
+                ) : (
+                  // Competitors exist, but the analysis produced nothing.
+                  // Either their titles overlap yours heavily (common when a
+                  // competitor is in the exact same niche) or there's only
+                  // one competitor so no word clears the "used by ≥2 videos"
+                  // bar. Be honest about it instead of telling them to add a
+                  // competitor they already added.
+                  <>
+                    No keyword gaps surfaced. Your {competitors.length}{" "}
+                    tracked competitor
+                    {competitors.length === 1 ? "" : "s"} either use the same
+                    title words you already do, or haven&apos;t been synced
+                    recently. Hit <strong>Sync All</strong> to refresh them,
+                    and add 2-3 more rival channels — more competitors = more
+                    distinct keywords to compare against.
+                  </>
+                )}
               </div>
             ) : (
               <>
