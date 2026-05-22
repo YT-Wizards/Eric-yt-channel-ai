@@ -190,7 +190,7 @@ export function VideoCommentsPanel({
     author: string | null
   ) => {
     try {
-      await fetch("/api/hooks-library", {
+      const res = await fetch("/api/hooks-library", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -200,9 +200,20 @@ export function VideoCommentsPanel({
           author,
         }),
       });
+      if (!res.ok) {
+        const d = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(d.error ?? `HTTP ${res.status}`);
+      }
       setSavedHookIds((prev) => new Set(prev).add(commentId));
-    } catch {
-      /* swallow — UI just won't flip */
+    } catch (e) {
+      // Previously this was swallowed silently — the button just didn't
+      // flip and the user couldn't tell if it worked. Surface the
+      // failure so "Save as hook" is never a mystery no-op.
+      alert(
+        `Couldn't save this comment to Hooks Library: ${
+          e instanceof Error ? e.message : "unknown error"
+        }`
+      );
     }
   };
 
@@ -419,28 +430,12 @@ export function VideoCommentsPanel({
                         >
                           <div className="flex items-start justify-between gap-2">
                             <span className="font-medium">@{h.author}</span>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              onClick={() =>
-                                fetch("/api/hooks-library", {
-                                  method: "POST",
-                                  headers: {
-                                    "Content-Type": "application/json",
-                                  },
-                                  body: JSON.stringify({
-                                    source_video_id: videoId,
-                                    quote: h.quote,
-                                    author: h.author,
-                                    note: h.why,
-                                  }),
-                                })
-                              }
-                              className="h-5 gap-1 text-[10px]"
-                            >
-                              <BookmarkPlus className="h-2.5 w-2.5" />
-                              Save
-                            </Button>
+                            <HookCandidateSaveButton
+                              videoId={videoId}
+                              quote={h.quote}
+                              author={h.author}
+                              why={h.why}
+                            />
                           </div>
                           <div className="mt-0.5 text-foreground">
                             &ldquo;{h.quote}&rdquo;
@@ -533,6 +528,80 @@ export function VideoCommentsPanel({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * Save button for an AI-surfaced hook candidate. Has its own state so
+ * the click gives real feedback — previously this was a bare fetch()
+ * with no .then/.catch, so saving a candidate looked like a no-op
+ * (nothing flipped, no error, no confirmation).
+ */
+function HookCandidateSaveButton({
+  videoId,
+  quote,
+  author,
+  why,
+}: {
+  videoId: string;
+  quote: string;
+  author: string;
+  why?: string;
+}) {
+  const [state, setState] = useState<"idle" | "saving" | "saved" | "error">(
+    "idle"
+  );
+
+  const save = async () => {
+    setState("saving");
+    try {
+      const res = await fetch("/api/hooks-library", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source_video_id: videoId,
+          quote,
+          author,
+          note: why,
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setState("saved");
+    } catch {
+      setState("error");
+      // Let the user retry — drop back to idle after a moment.
+      setTimeout(() => setState("idle"), 2500);
+    }
+  };
+
+  return (
+    <Button
+      size="sm"
+      variant="ghost"
+      onClick={save}
+      disabled={state === "saving" || state === "saved"}
+      className="h-5 gap-1 text-[10px]"
+      title={
+        state === "saved"
+          ? "Saved to Hooks Library"
+          : "Save this candidate to Hooks Library"
+      }
+    >
+      {state === "saving" ? (
+        <Loader2 className="h-2.5 w-2.5 animate-spin" />
+      ) : state === "saved" ? (
+        <Check className="h-2.5 w-2.5" />
+      ) : (
+        <BookmarkPlus className="h-2.5 w-2.5" />
+      )}
+      {state === "saving"
+        ? "Saving…"
+        : state === "saved"
+          ? "Saved"
+          : state === "error"
+            ? "Retry"
+            : "Save"}
+    </Button>
   );
 }
 
