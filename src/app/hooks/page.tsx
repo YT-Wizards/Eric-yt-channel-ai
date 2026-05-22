@@ -10,6 +10,8 @@ import {
   CheckCircle2,
   AlertCircle,
   RotateCw,
+  BookmarkPlus,
+  Check,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -726,6 +728,74 @@ function AverageScoresBars({ hooks }: { hooks: Hook[] }) {
   );
 }
 
+/**
+ * "Save as hook" button for an analysed Video Card. Sends the analysed
+ * hook text into the Hooks Library so the user can reuse it as an
+ * opening line later. The whole point: you save AFTER seeing the
+ * score/formula, not by guessing in the comments.
+ */
+function SaveHookButton({ hook }: { hook: Hook }) {
+  const [state, setState] = useState<"idle" | "saving" | "saved" | "error">(
+    "idle"
+  );
+
+  const save = async () => {
+    setState("saving");
+    try {
+      const res = await fetch("/api/hooks-library", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          quote: hook.hook_text,
+          source_video_id: hook.video_id,
+          // Carry the analysis context so the library row is meaningful:
+          // formula + overall score at a glance.
+          note: `${FORMULA_LABEL[hook.formula_type]} hook · scored ${hook.overall_score.toFixed(1)}/10`,
+        }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setState("saved");
+    } catch {
+      setState("error");
+      setTimeout(() => setState("idle"), 2500);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={save}
+      disabled={state === "saving" || state === "saved"}
+      className={cn(
+        "inline-flex items-center gap-1 rounded-md px-2 py-1.5 text-[11px] transition-colors",
+        state === "saved"
+          ? "text-emerald-600 dark:text-emerald-400"
+          : "text-muted-foreground hover:bg-primary/10 hover:text-primary"
+      )}
+      title={
+        state === "saved"
+          ? "Saved to Hooks Library"
+          : "Save this hook to the Hooks Library to reuse later"
+      }
+    >
+      {state === "saving" ? (
+        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+      ) : state === "saved" ? (
+        <Check className="h-3.5 w-3.5" />
+      ) : (
+        <BookmarkPlus className="h-3.5 w-3.5" />
+      )}
+      {state === "saving"
+        ? "Saving…"
+        : state === "saved"
+          ? "Saved"
+          : state === "error"
+            ? "Retry"
+            : "Save as hook"}
+    </button>
+  );
+}
+
 function HookCard({
   hook,
   reanalyzing,
@@ -806,6 +876,12 @@ function HookCard({
               )}
             </button>
           </div>
+        </div>
+
+        {/* Save-as-hook lives right here on the analysed card — you
+            decide what to keep AFTER seeing the score + formula. */}
+        <div className="mb-3 flex justify-end">
+          <SaveHookButton hook={hook} />
         </div>
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">

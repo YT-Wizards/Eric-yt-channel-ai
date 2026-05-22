@@ -226,7 +226,16 @@ export async function analyzeVideoHook(
   if (!transcript || !transcript.text.trim()) {
     return { ok: false, reason: "no transcript on file" };
   }
-  const hookText = transcript.text.slice(0, HOOK_CHAR_CAP).trim();
+  // Take the opening ~750 chars (~60s of speech) — that's the hook.
+  // If we cut mid-word, drop the dangling partial word so the stored +
+  // displayed hook ends on a clean word instead of "...civilizati".
+  let hookText = transcript.text.slice(0, HOOK_CHAR_CAP).trim();
+  if (transcript.text.length > HOOK_CHAR_CAP) {
+    const lastSpace = hookText.lastIndexOf(" ");
+    if (lastSpace > HOOK_CHAR_CAP * 0.8) {
+      hookText = hookText.slice(0, lastSpace).trim();
+    }
+  }
   if (hookText.length < 80) {
     return { ok: false, reason: "transcript too short for hook analysis" };
   }
