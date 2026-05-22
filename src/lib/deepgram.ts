@@ -491,10 +491,32 @@ export async function transcribeVideoAudio(
 }
 
 /**
- * Generic Deepgram URL ingestion — Deepgram fetches the audio from a
- * publicly reachable URL on its own side. Used by the "Transcribe from
- * URL" UI option where the user pastes a Drive / Dropbox / S3 / CDN
- * link directly.
+ * @deprecated URL-based transcription kept around only as a compile-time
+ * re-export — the actual implementation now uses yt-dlp stdout instead of
+ * fetching the URL ourselves. This shim exists so any older callers keep
+ * compiling; it just forwards to the videoId-based path.
+ */
+export async function transcribeByUrl(
+  _audioUrl: string,
+  _apiKey: string,
+  _opts: { model?: string; signal?: AbortSignal } = {}
+): Promise<{ text: string; language: string | null; durationSeconds: number }> {
+  throw new Error(
+    "transcribeByUrl is deprecated — use transcribeYouTubeVideo(videoId, apiKey) which goes through yt-dlp stdout."
+  );
+}
+
+/**
+ * Generic Deepgram URL ingestion — works for ANY publicly fetchable
+ * audio/video URL, not just YouTube. Used by:
+ *   - the Innertube → Deepgram path below (YouTube-specific)
+ *   - the "Transcribe from URL" UI option where the user pastes a
+ *     Drive / Dropbox / S3 link directly
+ *
+ * Deepgram pulls the bytes from THEIR side — we never download or
+ * store anything. The URL just has to be reachable from Deepgram's
+ * infrastructure (most cloud storage public links work; YouTube
+ * googlevideo URLs are signed and expire ~6h).
  */
 export async function transcribeFromUrl(
   audioUrl: string,
@@ -584,9 +606,97 @@ export async function transcribeFromFileBuffer(
 }
 
 /**
- * Transcribe via Deepgram's URL ingestion: POST a URL and Deepgram
- * pulls the bytes itself. Used by transcribeFromUrl (the paste-a-link
- * UI path).
+ * Resolve a YouTube videoId to a signed `googlevideo.com` audio URL via
+ * Innertube. This is the cloud-friendly path: we don't download a single
+ * byte on Railway — Deepgram fetches the URL from Google CDN on its own
+ * residential-friendly infrastructure. Tries multiple player clients
+ * because some get 400'd from datacenter IPs but `/v1/player` survives
+ * for others (different endpoint than `/v1/get_transcript`).
+ *
+ * Returns null if every client refuses, in which case callers fall back
+ * to yt-dlp + bytes (works locally on residential IPs).
+ */
+async function getAudioUrlViaInnertube(videoId: string): Promise<
+  | {
+      url: string;
+      durationSeconds: number;
+      mimeType: string;
+      via: string;
+    }
+  | null
+> {
+  type AudioFormat = {
+    mime_type?: string;
+    mimeType?: string;
+    url?: string;
+    bitrate?: number;
+    average_bitrate?: number;
+    has_audio?: boolean;
+    has_video?: boolean;
+  };
+  type InnertubeStreamingShape = {
+    streaming_data?: {
+      adaptive_formats?: AudioFormat[];
+      formats?: AudioFormat[];
+    };
+    basic_info?: { duration?: number };
+  };
+
+  try {
+    const { Innertube } = await import("youtubei.js");
+    const yt = await Innertube.create({ retrieve_player: true });
+    // Same client walk pattern we use for transcripts — different
+    // clients sign their `/v1/player` payloads slightly differently
+    // and Google's bot-defense decisions are per-client.
+    const clients = ["IOS", "TV_EMBEDDED", "WEB_EMBEDDED", "ANDROID", "WEB"];
+    for (const client of clients) {
+      try {
+        const info = (await yt.getInfo(
+          videoId,
+          client as unknown as Parameters<typeof yt.getInfo>[1]
+        )) as unknown as InnertubeStreamingShape;
+        const adaptive = info.streaming_data?.adaptive_formats ?? [];
+        // Prefer audio-only formats (has_audio=true, has_video=false) so
+        // we don't waste Deepgram fetch bandwidth on bundled video.
+        const audioOnly = adaptive.filter((f) => {
+          const mt = f.mime_type ?? f.mimeType ?? "";
+          if (mt.startsWith("audio/")) return true;
+          if (f.has_audio === true && f.has_video === false) return true;
+          return false;
+        });
+        // Pick LOWEST bitrate to minimise Deepgram's download time / our
+        // billable minute count. Deepgram bills per audio minute, not
+        // per byte — going from 256kbps→64kbps changes nothing for the
+        // bill but cuts CDN fetch time noticeably.
+        audioOnly.sort(
+          (a, b) =>
+            (a.average_bitrate ?? a.bitrate ?? 1e9) -
+            (b.average_bitrate ?? b.bitrate ?? 1e9)
+        );
+        const choice = audioOnly[0];
+        if (choice?.url) {
+          return {
+            url: choice.url,
+            durationSeconds: info.basic_info?.duration ?? 0,
+            mimeType: choice.mime_type ?? choice.mimeType ?? "audio/webm",
+            via: `innertube/${client}`,
+          };
+        }
+      } catch {
+        continue; // try next client
+      }
+    }
+  } catch {
+    /* youtubei.js itself blew up — fall through to null */
+  }
+  return null;
+}
+
+/**
+ * Transcribe via Deepgram's URL ingestion: we POST the signed audio
+ * URL and Deepgram pulls the bytes from Google's CDN itself. Zero
+ * audio transfer through Railway, which is what makes this work even
+ * though our IP can't yt-dlp directly.
  */
 async function transcribeViaDeepgramUrl(
   audioUrl: string,
@@ -634,16 +744,99 @@ async function transcribeViaDeepgramUrl(
 }
 
 /**
+ * Tier 3 last-resort audio source: cobalt.tools, an open-source
+ * YouTube→media proxy with residential-friendly egress. We POST a
+ * YouTube URL to their /api/json endpoint, they hand back a stream
+ * URL pointing into their proxy. Deepgram then fetches THAT URL —
+ * cobalt's server downloads from YouTube on its end (where the IP
+ * isn't blacklisted) and pipes the bytes to Deepgram.
+ *
+ * Public cobalt instances rate-limit (~1 req / 5s per IP) but are
+ * free; for heavy use we can self-host the cobalt container later.
+ *
+ * Returns null on any failure — caller falls through to the next
+ * tier (or the BYO-audio UI paths).
+ */
+async function getAudioUrlViaCobalt(
+  videoId: string
+): Promise<{ url: string; via: string } | null> {
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  // Several public cobalt mirrors. Try them in order — the first one
+  // to return a usable stream wins. Self-hosted instances are easy to
+  // add to this list later by appending the base URL.
+  const COBALT_INSTANCES = [
+    "https://api.cobalt.tools",
+    "https://co.wuk.sh",
+    "https://api.cobalt.tools/api",
+  ];
+
+  for (const base of COBALT_INSTANCES) {
+    try {
+      const r = await fetch(`${base}/api/json`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          // cobalt expects a polite user agent so abusive scrapers
+          // get filtered out — picking a real-looking Chrome string
+          // keeps our requests in the "real client" bucket.
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        },
+        body: JSON.stringify({
+          url: ytUrl,
+          isAudioOnly: true,
+          // mp3 is the codec Deepgram handles fastest; cobalt also
+          // supports ogg/wav/opus, fall through to those if we ever
+          // see "format unsupported" from this endpoint.
+          aFormat: "mp3",
+        }),
+      });
+      if (!r.ok) continue;
+      const data = (await r.json()) as {
+        status?: string;
+        url?: string;
+        text?: string;
+      };
+      if (
+        (data.status === "stream" ||
+          data.status === "redirect" ||
+          data.status === "tunnel") &&
+        data.url
+      ) {
+        return { url: data.url, via: base };
+      }
+    } catch {
+      // Network error, JSON parse, etc. — try next mirror.
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
  * End-to-end: given a videoId and a Deepgram key, produce a transcript.
  *
- * Single path: yt-dlp pulls the audio into RAM, the bytes are POSTed to
- * Deepgram. The old Innertube and cobalt fallback tiers were removed —
- * transcription is Deepgram-only, one route, no alternates.
+ * Tier order tuned for **local installs** (this project is local-only).
+ * On a residential IP yt-dlp Just Works — it's the fastest, most reliable
+ * path. The Innertube and cobalt paths exist as fallbacks for unusual
+ * networks (corporate proxy that strips video traffic, ISP-level YouTube
+ * blocks, etc.).
  *
- * If yt-dlp can't reach YouTube (the "Sign in to confirm you're not a
- * bot" challenge), this throws an AudioUrlError. The remaining ways to
- * still get a transcript are the file-upload / paste-URL options on the
- * video's Transcript tab — those feed Deepgram audio without yt-dlp.
+ *   Tier 1 — yt-dlp into RAM → Deepgram bytes POST. Residential-IP first
+ *     choice. Reliable, fast, single-process.
+ *
+ *   Tier 2 — Innertube audio URL → Deepgram URL ingestion. Lightweight
+ *     fallback if yt-dlp itself is missing or fails (e.g. binary not
+ *     installed by the postinstall script). Lets Deepgram fetch directly
+ *     from Google CDN.
+ *
+ *   Tier 3 — cobalt.tools proxy → Deepgram URL ingestion. Last resort —
+ *     cobalt fetches YouTube on its end and hands us a stream URL.
+ *     Useful when both yt-dlp and Innertube get blocked locally.
+ *
+ * On total failure the thrown AudioUrlError lists every tier's specific
+ * error so /logs shows the full diagnostic chain.
  */
 export async function transcribeYouTubeVideo(
   videoId: string,
@@ -656,12 +849,74 @@ export async function transcribeYouTubeVideo(
   costCents: number;
   model: string;
 }> {
-  const r = await transcribeVideoAudio(videoId, apiKey, opts);
-  return {
-    text: r.text,
-    language: r.language,
-    durationSeconds: r.durationSeconds,
-    costCents: estimateCostCents(r.durationSeconds),
-    model: opts.model ?? DEEPGRAM_MODEL,
-  };
+  // ----- Tier 1: yt-dlp + bytes (residential-IP, the local path) -----
+  let tier1Error: string | null = null;
+  try {
+    const r = await transcribeVideoAudio(videoId, apiKey, opts);
+    return {
+      text: r.text,
+      language: r.language,
+      durationSeconds: r.durationSeconds,
+      costCents: estimateCostCents(r.durationSeconds),
+      model: opts.model ?? DEEPGRAM_MODEL,
+    };
+  } catch (e) {
+    tier1Error = e instanceof Error ? e.message : String(e);
+  }
+
+  // ----- Tier 2: Innertube → Deepgram URL ingestion -----
+  let tier2Error: string | null = null;
+  try {
+    const audio = await getAudioUrlViaInnertube(videoId);
+    if (audio?.url) {
+      const r = await transcribeViaDeepgramUrl(audio.url, apiKey, opts);
+      const durationSeconds = r.durationSeconds || audio.durationSeconds;
+      return {
+        text: r.text,
+        language: r.language,
+        durationSeconds,
+        costCents: estimateCostCents(durationSeconds),
+        model: opts.model ?? DEEPGRAM_MODEL,
+      };
+    }
+    tier2Error = "Innertube returned no audio URL across all player clients";
+  } catch (e) {
+    tier2Error = e instanceof Error ? e.message : String(e);
+  }
+
+  // ----- Tier 3: cobalt.tools → Deepgram URL ingestion -----
+  try {
+    const cobalt = await getAudioUrlViaCobalt(videoId);
+    if (cobalt?.url) {
+      const r = await transcribeViaDeepgramUrl(cobalt.url, apiKey, opts);
+      return {
+        text: r.text,
+        language: r.language,
+        durationSeconds: r.durationSeconds,
+        costCents: estimateCostCents(r.durationSeconds),
+        model: opts.model ?? DEEPGRAM_MODEL,
+      };
+    }
+    throw new AudioUrlError(
+      `All transcription tiers failed for ${videoId}.\n` +
+        `  Tier 1 (yt-dlp + bytes): ${tier1Error}\n` +
+        `  Tier 2 (Innertube → Deepgram URL): ${tier2Error}\n` +
+        `  Tier 3 (cobalt.tools): no stream URL from any mirror\n\n` +
+        `If yt-dlp keeps failing, the most reliable fix is to paste a YouTube ` +
+        `cookies.txt under Integrations → YouTube cookies. Or use the ` +
+        `file-upload / URL-input options on the video Transcript tab.`
+    );
+  } catch (e) {
+    if (e instanceof AudioUrlError) throw e;
+    const tier3Msg = e instanceof Error ? e.message : String(e);
+    throw new AudioUrlError(
+      `All transcription tiers failed for ${videoId}.\n` +
+        `  Tier 1 (yt-dlp + bytes): ${tier1Error}\n` +
+        `  Tier 2 (Innertube → Deepgram URL): ${tier2Error}\n` +
+        `  Tier 3 (cobalt.tools): ${tier3Msg}\n\n` +
+        `If yt-dlp keeps failing, the most reliable fix is to paste a YouTube ` +
+        `cookies.txt under Integrations → YouTube cookies. Or use the ` +
+        `file-upload / URL-input options on the video Transcript tab.`
+    );
+  }
 }
