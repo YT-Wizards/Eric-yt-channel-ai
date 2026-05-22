@@ -37,6 +37,10 @@ import {
   youtubeSuggest,
 } from "./youtube";
 import { apifyYouTubeScrape } from "./apify";
+import {
+  getPlatformGuide,
+  PLATFORM_GUIDE_TOPICS,
+} from "./platform-guide";
 import { transcribeYouTubeVideo } from "./deepgram";
 import { runSelect, SQL_SCHEMA } from "./sql-tool";
 import {
@@ -465,6 +469,24 @@ const STRATEGY_TOOLS: Tool[] = [
     description:
       "List the user's Hooks Library — comments / quotes they saved to reuse as opening lines in future videos. Includes status (available / used), source video, score. Use when planning a new video to remind the user of unused material they already curated.",
     input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "get_platform_help",
+    description:
+      "Read the YT Channel AI platform documentation. Call this whenever the user asks how the app itself works — 'how does Hook Lab work', 'where do I sync new videos', 'why is this page empty', 'what does success rate mean', 'which API keys do I need'. Returns the relevant section of the user guide so you can answer accurately instead of guessing. With no topic it returns an overview + the list of topics; pass a topic to drill in. Topics: " +
+      PLATFORM_GUIDE_TOPICS.join(", ") +
+      ".",
+    input_schema: {
+      type: "object",
+      properties: {
+        topic: {
+          type: "string",
+          enum: [...PLATFORM_GUIDE_TOPICS],
+          description:
+            "Which section of the guide to read. Omit for the overview + topic index.",
+        },
+      },
+    },
   },
 ];
 
@@ -941,6 +963,11 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
           },
         };
       }
+      case "get_platform_help": {
+        const topic =
+          typeof input.topic === "string" ? input.topic : undefined;
+        return { ok: true, data: { guide: getPlatformGuide(topic) } };
+      }
       case "list_saved_hooks": {
         const hooks = listHooksLibrary();
         return {
@@ -1041,7 +1068,9 @@ export function buildSystemPrompt(
     `- Apify is the optional fallback path for competitor scraping when no YouTube Data API key is configured.`,
     `- Anthropic Claude or Google Gemini powers this chat (you), plus Hook Lab analysis, plus per-video Comment AI analysis. The user picks the chat model in the header dropdown; Hook Lab has its own model picker.`,
     ``,
-    `You can read every dataset every page reads. When a user asks "what does the Formula Analyzer say about my titles" — call \`get_formula_breakdown\` and answer with the actual numbers; you don't have to send them back to the page.`
+    `You can read every dataset every page reads. When a user asks "what does the Formula Analyzer say about my titles" — call \`get_formula_breakdown\` and answer with the actual numbers; you don't have to send them back to the page.`,
+    ``,
+    `**When the user asks how the APP itself works** (how a page works, where a button is, why something is empty, what a metric means, which keys are needed) — call \`get_platform_help\` to read the exact documentation section, then answer from it. Don't guess about the product; the guide is authoritative.`
   );
 
   // -----------------------------------------------------------------
@@ -1106,6 +1135,7 @@ export function buildSystemPrompt(
     `- **\`list_competitor_alerts\`** *(unreadOnly, limit)* — outlier alerts: videos from tracked competitors that crossed ≥2× their channel median. The leading indicator of "something is going viral in this niche right now". Critical for ideation.`,
     `- **\`competitor_gap_analysis\`** *(topN)* — title keywords frequent in competitors' top videos that the user has NEVER used in any of their own titles. Ranked by aggregate competitor views.`,
     `- **\`list_saved_hooks\`** — Hooks Library entries (comments / quotes the creator bookmarked for future use). Useful when planning a new video to remind the user of unused material they already curated.`,
+    `- **\`get_platform_help\`** *(optional topic)* — the YT Channel AI user guide. Call it to answer "how does this app work" questions accurately. Topics: overview, dashboard, videos, hook-lab, formula-analyzer, hooks-library, competitors, chat, integrations, settings, jobs, troubleshooting.`,
     ``,
     `## YouTube Data API tools (needs YouTube Data API key, costs quota)`,
     `- **\`get_video_comments\`** *(videoId, max)* — live YouTube comments via the public API. Costs 1 unit per ~100 comments. Use \`list_video_comments_cached\` first when possible — it's free and instant.`,

@@ -1,6 +1,12 @@
 import "server-only";
 import type Anthropic from "@anthropic-ai/sdk";
-import { getComment, getTranscript, getVideo, listReplies } from "./db";
+import {
+  getComment,
+  getTranscript,
+  getVideo,
+  listReplies,
+  listTopLevelComments,
+} from "./db";
 
 export type AttachmentInput =
   | { type: "video"; id: string }
@@ -182,6 +188,39 @@ function renderVideoBlock(id: string, forStorage: ResolvedAttachment[]): string 
     );
   } else {
     lines.push(`- transcript: (not available)`);
+  }
+
+  // Top comments — attached automatically with the video so the model
+  // can reason about audience reaction without the user separately
+  // attaching individual comment threads. Cached comments only (synced
+  // via the Videos page); top 15 by like count, each capped so a few
+  // attached videos can't blow the context budget.
+  const TOP_COMMENTS = 15;
+  const PER_COMMENT_CAP = 280;
+  const topComments = listTopLevelComments(v.id, TOP_COMMENTS, 0);
+  if (topComments.length > 0) {
+    lines.push(
+      ``,
+      `- top_comments (${topComments.length} most-liked, cached):`
+    );
+    for (const c of topComments) {
+      const text =
+        c.text.length > PER_COMMENT_CAP
+          ? c.text.slice(0, PER_COMMENT_CAP) + "…"
+          : c.text;
+      const flat = text.replace(/\s+/g, " ").trim();
+      lines.push(
+        `  - [${c.author ?? "?"}, ${c.like_count}♥, ${c.reply_count} replies] ${flat}`
+      );
+    }
+    lines.push(
+      `  (Use search_my_comments or list_video_comments_cached for the full set.)`
+    );
+  } else {
+    lines.push(
+      ``,
+      `- top_comments: (none cached — user can sync this video's comments from its Comments tab)`
+    );
   }
   return lines.join("\n");
 }

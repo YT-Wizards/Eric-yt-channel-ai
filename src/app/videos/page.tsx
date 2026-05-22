@@ -19,6 +19,7 @@ import { useI18n } from "@/lib/i18n/provider";
 import { cn } from "@/lib/utils";
 import { TranscribeAllBanner } from "@/components/transcribe-all-banner";
 import { SyncAllCommentsBanner } from "@/components/sync-all-comments-banner";
+import { SyncChannelButton } from "@/components/sync-channel-button";
 
 type Video = {
   id: string;
@@ -86,6 +87,10 @@ export default function VideosPage() {
   const [q, setQ] = useState("");
   const [sort, setSort] = useState<Sort>("recent");
   const [duration, setDuration] = useState<Duration>("all");
+  // Bumped by the Sync button when a channel sync finishes — re-runs the
+  // fetch effect below so the freshly-synced videos appear without a
+  // manual page reload.
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     const url = new URL("/api/videos", window.location.origin);
@@ -104,7 +109,7 @@ export default function VideosPage() {
       ctrl.abort();
       clearTimeout(id);
     };
-  }, [q, sort, duration]);
+  }, [q, sort, duration, refreshKey]);
 
   const sortOptions: { value: Sort; label: string }[] = useMemo(
     () => [
@@ -129,9 +134,14 @@ export default function VideosPage() {
 
   return (
     <div className="mx-auto max-w-6xl">
-      <header className="mb-6">
-        <h1 className="text-2xl font-semibold tracking-tight">{t.videos.title}</h1>
-        <p className="mt-1 text-sm text-muted-foreground">{t.videos.subtitle}</p>
+      <header className="mb-6 flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">{t.videos.title}</h1>
+          <p className="mt-1 text-sm text-muted-foreground">{t.videos.subtitle}</p>
+        </div>
+        {/* One-click "pull my latest uploads". Re-syncs the active
+            channel and bumps refreshKey so the list re-fetches. */}
+        <SyncChannelButton onSynced={() => setRefreshKey((k) => k + 1)} />
       </header>
 
       <TranscribeAllBanner />

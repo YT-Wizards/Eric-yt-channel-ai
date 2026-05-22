@@ -938,7 +938,7 @@ function ChatPageInner() {
                   prev.some((a) => a.id === ref.id) ? prev : [...prev, ref]
                 );
               }}
-              alreadyAttachedIds={new Set(attachments.map((a) => a.id))}
+              attachments={attachments}
             />
             {!hasKey && (
               <p className="mt-2 text-center text-xs text-muted-foreground">
