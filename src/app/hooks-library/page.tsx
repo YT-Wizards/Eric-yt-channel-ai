@@ -8,9 +8,13 @@ import {
   Star,
   Check,
   RotateCcw,
+  Plus,
+  X,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 
 type Hook = {
@@ -40,6 +44,14 @@ export default function HooksLibraryPage() {
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<"all" | "available" | "used">("all");
   const [error, setError] = useState<string | null>(null);
+  // "Add hook" inline form — lets the user put their own idea / quote
+  // straight into the library, without it having to come from a video
+  // comment. The POST endpoint already accepts a comment-less entry.
+  const [addOpen, setAddOpen] = useState(false);
+  const [draftQuote, setDraftQuote] = useState("");
+  const [draftAuthor, setDraftAuthor] = useState("");
+  const [draftNote, setDraftNote] = useState("");
+  const [saving, setSaving] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -85,6 +97,39 @@ export default function HooksLibraryPage() {
     refresh();
   };
 
+  // Save a hand-typed hook. quote is the only required field; author /
+  // note are optional context for the user's own reference.
+  const addManualHook = async () => {
+    const quote = draftQuote.trim();
+    if (!quote) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/hooks-library", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          quote,
+          author: draftAuthor.trim() || null,
+          note: draftNote.trim() || null,
+        }),
+      });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        throw new Error(d.error ?? `HTTP ${r.status}`);
+      }
+      setDraftQuote("");
+      setDraftAuthor("");
+      setDraftNote("");
+      setAddOpen(false);
+      refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "failed to add hook");
+    } finally {
+      setSaving(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="mx-auto max-w-5xl">
@@ -112,21 +157,31 @@ export default function HooksLibraryPage() {
             Available {availableCount} · Used {usedCount}.
           </p>
         </div>
-        <div className="flex gap-1">
-          {(["all", "available", "used"] as const).map((f) => (
-            <button
-              key={f}
-              onClick={() => setFilter(f)}
-              className={cn(
-                "rounded-full border px-2.5 py-0.5 text-xs capitalize transition-colors",
-                filter === f
-                  ? "border-primary bg-primary/10 text-primary"
-                  : "border-border text-muted-foreground hover:text-foreground"
-              )}
-            >
-              {f}
-            </button>
-          ))}
+        <div className="flex items-center gap-2">
+          <div className="flex gap-1">
+            {(["all", "available", "used"] as const).map((f) => (
+              <button
+                key={f}
+                onClick={() => setFilter(f)}
+                className={cn(
+                  "rounded-full border px-2.5 py-0.5 text-xs capitalize transition-colors",
+                  filter === f
+                    ? "border-primary bg-primary/10 text-primary"
+                    : "border-border text-muted-foreground hover:text-foreground"
+                )}
+              >
+                {f}
+              </button>
+            ))}
+          </div>
+          <Button
+            size="sm"
+            onClick={() => setAddOpen((v) => !v)}
+            className="gap-1.5"
+          >
+            {addOpen ? <X className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+            {addOpen ? "Cancel" : "Add hook"}
+          </Button>
         </div>
       </header>
 
@@ -136,11 +191,81 @@ export default function HooksLibraryPage() {
         </div>
       )}
 
+      {/* Inline "add your own hook" form. The library isn't only for
+          comment-sourced quotes — you can drop any idea / line you want
+          to reuse straight in here. */}
+      {addOpen && (
+        <Card className="mb-3">
+          <CardContent className="space-y-3 p-4">
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-muted-foreground">
+                Hook / quote <span className="text-destructive">*</span>
+              </label>
+              <Textarea
+                value={draftQuote}
+                onChange={(e) => setDraftQuote(e.target.value)}
+                placeholder="The opening line or idea you want to reuse in a future video…"
+                className="min-h-[80px] text-sm"
+                autoFocus
+              />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Author / source <span className="text-muted-foreground/60">(optional)</span>
+                </label>
+                <Input
+                  value={draftAuthor}
+                  onChange={(e) => setDraftAuthor(e.target.value)}
+                  placeholder="e.g. a viewer's name, a book, yourself"
+                  className="text-sm"
+                />
+              </div>
+              <div className="space-y-1">
+                <label className="text-xs font-medium text-muted-foreground">
+                  Note <span className="text-muted-foreground/60">(optional)</span>
+                </label>
+                <Input
+                  value={draftNote}
+                  onChange={(e) => setDraftNote(e.target.value)}
+                  placeholder="Why it works / where to use it"
+                  className="text-sm"
+                />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={() => setAddOpen(false)}
+                disabled={saving}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                onClick={addManualHook}
+                disabled={saving || !draftQuote.trim()}
+                className="gap-1.5"
+              >
+                {saving ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Check className="h-3.5 w-3.5" />
+                )}
+                Save to library
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {filtered.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center text-sm text-muted-foreground">
-            No hooks saved yet. Open a video&apos;s Comments tab and click{" "}
-            <strong>+ Save as hook</strong> on any comment to start the library.
+            No hooks saved yet. Click <strong>+ Add hook</strong> above to type
+            in your own idea, or open a video&apos;s Comments tab and click{" "}
+            <strong>Save as hook</strong> on any comment.
           </CardContent>
         </Card>
       ) : (
