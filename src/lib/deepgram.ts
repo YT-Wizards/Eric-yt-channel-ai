@@ -248,6 +248,127 @@ export async function resolveAudioUrl(videoId: string): Promise<{
   };
 }
 
+/* ============================================================
+ * yt-dlp subtitle extraction — the FAST, FREE transcript path.
+ *
+ * The bare-HTTP timedtext probe (youtube.ts → fetchTranscriptFree)
+ * gets bot-blocked a lot — YouTube serves a captions-stripped page to
+ * anything that doesn't look like a real browser session. yt-dlp,
+ * however, carries every bypass the community has built and is already
+ * working on this machine (the Deepgram path uses it). So when the
+ * plain probe fails we ask yt-dlp for the caption tracks directly.
+ *
+ * `--dump-single-json` returns `subtitles` (human-made) and
+ * `automatic_captions` (ASR) maps: { langCode: [{ url, ext }, ...] }.
+ * We fetch the best track and parse it to plain text. This is seconds
+ * of work and $0 — versus a minute-plus of audio download + paid
+ * Deepgram time. Most videos have at least automatic_captions, so this
+ * tier carries the bulk of a transcribe batch.
+ * ============================================================ */
+
+type YtDlpCaptionTrack = { url?: string; ext?: string; name?: string };
+type YtDlpInfoCaptions = YtDlpInfo & {
+  subtitles?: Record<string, YtDlpCaptionTrack[]>;
+  automatic_captions?: Record<string, YtDlpCaptionTrack[]>;
+};
+
+/** Parse YouTube's json3 caption format → plain text. Cleanest source:
+ *  no duplicated rolling-caption lines, no inline timing tags. */
+function parseJson3Captions(body: string): string {
+  try {
+    const data = JSON.parse(body) as {
+      events?: Array<{ segs?: Array<{ utf8?: string }> }>;
+    };
+    const parts: string[] = [];
+    for (const ev of data.events ?? []) {
+      for (const seg of ev.segs ?? []) {
+        if (seg.utf8) parts.push(seg.utf8);
+      }
+    }
+    return parts.join("").replace(/\s+/g, " ").trim();
+  } catch {
+    return "";
+  }
+}
+
+/** Parse a WebVTT caption file → plain text. Auto-captions repeat each
+ *  line as they "roll", so we drop consecutive duplicates. */
+function parseVttCaptions(body: string): string {
+  const out: string[] = [];
+  for (const rawLine of body.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("WEBVTT")) continue;
+    if (line.includes("-->")) continue;
+    if (/^\d+$/.test(line)) continue; // cue index
+    if (/^(NOTE|STYLE|REGION|Kind:|Language:)/.test(line)) continue;
+    // Strip inline timing tags (<00:00:01.000>) and <c> styling tags.
+    const clean = line.replace(/<[^>]+>/g, "").trim();
+    if (clean && out[out.length - 1] !== clean) out.push(clean);
+  }
+  return out.join(" ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Pull a transcript from a video's YouTube caption tracks via yt-dlp.
+ * Returns null when the video genuinely has no captions (caller then
+ * falls through to Deepgram).
+ */
+export async function fetchCaptionsViaYtDlp(
+  videoId: string
+): Promise<{ text: string; language: string } | null> {
+  const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const cookies = maybeWriteCookiesTempFile();
+  let info: YtDlpInfoCaptions;
+  try {
+    info = (await youtubeDl(ytUrl, {
+      dumpSingleJson: true,
+      skipDownload: true,
+      ...ytDlpCommonFlags(cookies?.path ?? null),
+    })) as unknown as YtDlpInfoCaptions;
+  } catch {
+    return null;
+  } finally {
+    cookies?.cleanup();
+  }
+
+  // Manual subtitles are higher quality than ASR — try them first.
+  // Within each pool prefer English-family language codes.
+  for (const pool of [info.subtitles, info.automatic_captions]) {
+    if (!pool) continue;
+    const langs = Object.keys(pool);
+    const ordered = [
+      ...langs.filter((l) => l.toLowerCase().startsWith("en")),
+      ...langs.filter((l) => !l.toLowerCase().startsWith("en")),
+    ];
+    for (const lang of ordered) {
+      const tracks = pool[lang] ?? [];
+      // json3 parses cleanest; vtt is the reliable fallback.
+      const track =
+        tracks.find((t) => t.ext === "json3") ??
+        tracks.find((t) => t.ext === "vtt") ??
+        tracks.find((t) => t.ext === "srv3" || t.ext === "srv1") ??
+        tracks[0];
+      if (!track?.url) continue;
+      try {
+        const res = await fetch(track.url, { cache: "no-store" });
+        if (!res.ok) continue;
+        const body = await res.text();
+        const text =
+          track.ext === "json3"
+            ? parseJson3Captions(body)
+            : parseVttCaptions(body);
+        if (text.length >= 120) {
+          return { text, language: lang };
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+  return null;
+}
+
 type DeepgramListenResponse = {
   results?: {
     channels?: Array<{

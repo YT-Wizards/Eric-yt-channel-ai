@@ -12,7 +12,11 @@ import {
   upsertTranscript,
   type TranscribeCandidate,
 } from "@/lib/db";
-import { estimateCostCents, transcribeYouTubeVideo } from "@/lib/deepgram";
+import {
+  estimateCostCents,
+  fetchCaptionsViaYtDlp,
+  transcribeYouTubeVideo,
+} from "@/lib/deepgram";
 import { fetchTranscriptFree } from "@/lib/youtube";
 import { log } from "@/lib/logger";
 
@@ -302,12 +306,11 @@ async function runBatch(
       const v = videos[i];
       updateTranscriptionJob(jobId, { current_video_id: v.id });
       try {
-        // ---- Fast path: free YouTube captions ----
+        // ---- Fast path A: bare timedtext probe ----
         // Deepgram is slow (yt-dlp pulls the whole audio track into
-        // RAM, then uploads it) and costs money. The overwhelming
-        // majority of videos already have YouTube auto-captions, which
-        // are instant and free. Try those FIRST; only pay for Deepgram
-        // when a video genuinely has no usable caption track.
+        // RAM, then uploads it) and costs money. Most videos have
+        // YouTube captions, which are instant and free. Try the cheap
+        // bare-HTTP probe first.
         let captioned = false;
         try {
           const free = await fetchTranscriptFree(v.id);
@@ -318,7 +321,30 @@ async function runBatch(
             done++;
           }
         } catch {
-          // timedtext blocked / unavailable — fall through to Deepgram.
+          // timedtext blocked / unavailable — fall through.
+        }
+
+        // ---- Fast path B: yt-dlp subtitle extraction ----
+        // The bare probe above is bot-blocked a lot. yt-dlp carries the
+        // bypasses and pulls the same caption tracks reliably — still
+        // free, still seconds (no audio download, no Deepgram). This
+        // tier is what saves a batch when path A returns nothing for
+        // every video.
+        if (!captioned) {
+          try {
+            const viaYtdlp = await fetchCaptionsViaYtDlp(v.id);
+            if (
+              viaYtdlp &&
+              viaYtdlp.text.trim().length >= MIN_FREE_CAPTION_CHARS
+            ) {
+              upsertTranscript(v.id, viaYtdlp.text, viaYtdlp.language);
+              captioned = true;
+              freeCaptionCount++;
+              done++;
+            }
+          } catch {
+            // No captions via yt-dlp either — fall through to Deepgram.
+          }
         }
 
         // ---- Slow path: Deepgram ----
