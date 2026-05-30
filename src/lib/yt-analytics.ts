@@ -171,7 +171,34 @@ export async function runReport(q: ReportQuery): Promise<ReportResponse> {
     // parameter if present (e.g. "channel==UCxxx"), else fall back to
     // active channel. Otherwise a 403 on Channel B would falsely tag
     // Channel A as denied too.
-    if (q.isMonetary && (res.status === 403 || res.status === 401)) {
+    // Only a *permanent* denial (Manager-tier / non-monetised channel —
+    // reason "insufficientPermissions" / "forbidden") should stick. A
+    // transient failure (quota / rate-limit / backend hiccup) ALSO comes
+    // back as 403/401; treating it as permanent silently drops this
+    // channel from combined-revenue totals until a forced refresh — which
+    // a user reads as "my total revenue went down" (and a heavier 90d
+    // query trips rate limits more than a 28d one, so the longer period
+    // can paradoxically show LESS). Let transient errors fall through so
+    // the channel is retried on the next poll instead of being buried.
+    const TRANSIENT_MONETARY_REASONS = new Set([
+      "rateLimitExceeded",
+      "userRateLimitExceeded",
+      "quotaExceeded",
+      "dailyLimitExceeded",
+      "backendError",
+      "internalError",
+      "transientError",
+      "SERVICE_UNAVAILABLE",
+    ]);
+    const transientMonetaryError =
+      res.status === 429 ||
+      res.status >= 500 ||
+      (reason ? TRANSIENT_MONETARY_REASONS.has(reason) : false);
+    if (
+      q.isMonetary &&
+      (res.status === 403 || res.status === 401) &&
+      !transientMonetaryError
+    ) {
       const cidMatch = q.ids?.match(/channel==([\w-]+)/);
       setRevenueAccessFlag("denied", cidMatch?.[1]);
       log.warn("yt-analytics", "Monetary access denied — flag set to 'denied'", {
