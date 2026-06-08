@@ -46,13 +46,32 @@ export async function GET() {
 }
 
 export async function POST(req: Request) {
-  const body = (await req.json()) as { name?: string; api_key?: string };
+  let body: { name?: string; api_key?: string };
+  try {
+    body = (await req.json()) as { name?: string; api_key?: string };
+  } catch {
+    return NextResponse.json({ error: "invalid JSON body" }, { status: 400 });
+  }
   if (!body.name || !ALLOWED.includes(body.name as Name)) {
     return NextResponse.json({ error: "invalid integration name" }, { status: 400 });
   }
   if (typeof body.api_key !== "string") {
     return NextResponse.json({ error: "api_key required" }, { status: 400 });
   }
-  setIntegration(body.name, body.api_key.trim());
+  try {
+    setIntegration(body.name, body.api_key.trim());
+  } catch (err) {
+    // The local SQLite write can fail for environment reasons that are
+    // invisible to the user: the project folder is read-only, the disk is
+    // full, or the better-sqlite3 native binary didn't build for this
+    // machine (common on a fresh macOS without Xcode Command Line Tools).
+    // Return the real reason so the UI can show it instead of pretending
+    // the key was saved.
+    const message = err instanceof Error ? err.message : "unknown database error";
+    return NextResponse.json(
+      { error: `could not save to the local database — ${message}` },
+      { status: 500 }
+    );
+  }
   return NextResponse.json({ ok: true });
 }

@@ -232,19 +232,42 @@ function IntegrationCard({
   const [show, setShow] = useState(false);
   const [saving, setSaving] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const save = async () => {
     setSaving(true);
+    setError(null);
     try {
-      await fetch("/api/integrations", {
+      const res = await fetch("/api/integrations", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ name, api_key: value }),
       });
+      // Previously we ignored the response entirely and always showed
+      // "Saved" — so a 500 (e.g. the local SQLite write failing) looked
+      // identical to success and the key silently never persisted. Surface
+      // the real error instead; that's what makes a stuck install
+      // debuggable ("nothing happens" → an actual message).
+      if (!res.ok) {
+        let msg = `Save failed (HTTP ${res.status})`;
+        try {
+          const data = (await res.json()) as { error?: string };
+          if (data?.error) msg = `Save failed: ${data.error}`;
+        } catch {
+          /* server returned a non-JSON crash page — keep the HTTP code */
+        }
+        setError(msg);
+        return;
+      }
       setValue("");
       setJustSaved(true);
       onSaved();
       setTimeout(() => setJustSaved(false), 1800);
+    } catch {
+      // fetch() itself threw → the local server isn't reachable.
+      setError(
+        "Couldn't reach the local server. Make sure the app window (the terminal that started it) is still open, then try again."
+      );
     } finally {
       setSaving(false);
     }
@@ -343,6 +366,11 @@ function IntegrationCard({
               )}
             </Button>
           </div>
+          {error && (
+            <p className="text-xs text-destructive" role="alert">
+              {error}
+            </p>
+          )}
         </div>
           </>
         )}
