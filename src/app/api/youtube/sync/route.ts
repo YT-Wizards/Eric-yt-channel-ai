@@ -1,6 +1,7 @@
 import {
   commentCount,
   createCommentSyncJob,
+  getActiveChannelId,
   getActiveCommentSyncJob,
   getActiveTranscriptionJob,
   getIntegration,
@@ -134,8 +135,27 @@ export async function POST(req: Request) {
     );
   }
 
-  // Determine what channel to sync: explicit input > saved binding
-  const input = body.input?.trim() || getSetting("youtube.channelInput");
+  // Determine what channel to sync. Precedence:
+  //   1. explicit body.input — the "add a new channel" flow (Integrations)
+  //      passes this and DOES intend to switch the active channel to it.
+  //   2. the ACTIVE channel — via its recorded per-channel input, falling
+  //      back to the active channel ID itself (resolveChannel accepts a raw
+  //      UC… id, no search-quota cost).
+  //   3. the legacy global binding, only as a last resort.
+  //
+  // Using the active channel (NOT the global `youtube.channelInput`) is what
+  // makes the Videos-page "Sync channel" button re-sync the channel the user
+  // is actually looking at. `youtube.channelInput` holds the LAST-SYNCED
+  // channel, and switching the active channel never updates it — so on a
+  // multi-channel account the old `body.input || youtube.channelInput` logic
+  // synced, and then `setActiveChannelId(ch.id)` below switched to, the WRONG
+  // channel every time (the "sync jumps me to another channel" bug).
+  const activeId = getActiveChannelId();
+  const input =
+    body.input?.trim() ||
+    (activeId ? getSetting(`youtube.channelInput.${activeId}`) : null) ||
+    activeId ||
+    getSetting("youtube.channelInput");
   if (!input) {
     return Response.json(
       { error: "No channel bound. Provide input (handle/URL/ID) or bind a channel first." },

@@ -2,6 +2,7 @@ import "server-only";
 import type Anthropic from "@anthropic-ai/sdk";
 import {
   competitorGapAnalysis,
+  getActiveChannelId,
   getChannel,
   getComment,
   getCommentAnalysis,
@@ -494,8 +495,40 @@ export function getToolsFor(groups: ToolGroup[]): Tool[] {
 
 type ToolResult = { ok: true; data: unknown } | { ok: false; error: string };
 
+// Tools that read the user's OWN-channel local data. Each is scoped to the
+// currently-active channel under the hood. When NO channel is active these
+// would otherwise return empty/zero payloads — which the model reads as "the
+// creator has no videos / no hooks / no data" when the real cause is simply
+// that no channel is selected. We fail loudly and actionably instead, exactly
+// like execute_sql already does, so the model gives consistent guidance no
+// matter which tool it reached for. (competitor_gap_analysis lives here too:
+// it diffs competitor titles against the user's OWN titles, so with no active
+// channel every competitor word looks like a "gap" — garbage output.)
+const CHANNEL_SCOPED_TOOLS = new Set<string>([
+  "channel_summary",
+  "list_my_videos",
+  "search_my_transcripts",
+  "list_video_comments_cached",
+  "search_my_comments",
+  "get_comment_thread",
+  "get_hook_stats",
+  "list_hook_breakdowns",
+  "get_video_hook",
+  "get_formula_breakdown",
+  "get_comment_analysis",
+  "list_saved_hooks",
+  "competitor_gap_analysis",
+]);
+
 export async function runTool(name: string, input: ToolInput): Promise<ToolResult> {
   try {
+    if (CHANNEL_SCOPED_TOOLS.has(name) && !getActiveChannelId()) {
+      return {
+        ok: false,
+        error:
+          "NO_ACTIVE_CHANNEL: No channel is selected, so this channel-scoped tool has no data to read (this is NOT the same as the channel having no data). Tell the user to pick a channel via the Channel Switcher in the top-right of the app, then ask again.",
+      };
+    }
     switch (name) {
       case "channel_summary": {
         const channel = getChannel();
@@ -626,7 +659,7 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
         if (!query) return { ok: false, error: "query required" };
         const result = runSelect(query, 200);
         // Convert to array of objects for readability
-        const { columns, rows } = result;
+        const { columns, rows, truncated } = result;
         const objects = rows.map((r) => {
           const obj: Record<string, unknown> = {};
           columns.forEach((c, i) => {
@@ -634,7 +667,20 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
           });
           return obj;
         });
-        return { ok: true, data: { columns, rowCount: rows.length, rows: objects } };
+        return {
+          ok: true,
+          data: {
+            columns,
+            rowCount: rows.length,
+            rows: objects,
+            truncated,
+            ...(truncated
+              ? {
+                  note: `Result capped at ${rows.length} rows — MORE rows matched than are shown. Add a tighter WHERE/LIMIT or an aggregate (COUNT/AVG) if you need the full picture; do NOT assume these are all the matching rows.`,
+                }
+              : {}),
+          },
+        };
       }
       case "youtube_trending": {
         const key = requireKey("youtube");
@@ -726,6 +772,19 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
               error: err instanceof Error ? err.message : "transcription failed",
             });
           }
+        }
+        // If EVERY url failed, surface it as a tool failure rather than
+        // ok:true with an all-errors array — otherwise the model reads it as
+        // "transcripts fetched" and reasons on empty strings.
+        const succeeded = results.filter((r) => !r.error && r.transcript);
+        if (succeeded.length === 0) {
+          const reasons = results
+            .map((r) => `${r.videoId ?? r.url}: ${r.error ?? "empty transcript"}`)
+            .join("; ");
+          return {
+            ok: false,
+            error: `All ${results.length} transcription(s) failed — ${reasons}`,
+          };
         }
         return { ok: true, data: results };
       }
@@ -908,27 +967,38 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
               "No comment analysis cached for this video. Open the Comments tab and click 'Analyse with AI' first.",
           };
         }
-        const safe = <T,>(s: string | null, fb: T): T => {
+        // Parse the stored JSON columns. If a column is present but corrupt,
+        // DON'T silently fall back to an empty array — the model would read
+        // that as "no themes / no future ideas" when the data is actually
+        // there but unreadable. Record which fields failed so we can flag it.
+        const parseFailures: string[] = [];
+        const safe = <T,>(s: string | null, fb: T, field: string): T => {
           if (!s) return fb;
           try {
             return JSON.parse(s) as T;
           } catch {
+            parseFailures.push(field);
             return fb;
           }
         };
-        return {
-          ok: true,
-          data: {
-            sentimentScore: a.sentiment_score,
-            themes: safe(a.themes, [] as string[]),
-            objections: safe(a.objections, [] as unknown[]),
-            futureIdeas: safe(a.future_ideas, [] as unknown[]),
-            hookCandidates: safe(a.hook_candidates, [] as unknown[]),
-            summary: a.summary,
-            analyzedAt: a.analyzed_at,
-            commentsCount: a.comments_count,
-          },
+        const data = {
+          sentimentScore: a.sentiment_score,
+          themes: safe(a.themes, [] as string[], "themes"),
+          objections: safe(a.objections, [] as unknown[], "objections"),
+          futureIdeas: safe(a.future_ideas, [] as unknown[], "future_ideas"),
+          hookCandidates: safe(a.hook_candidates, [] as unknown[], "hook_candidates"),
+          summary: a.summary,
+          analyzedAt: a.analyzed_at,
+          commentsCount: a.comments_count,
+          ...(parseFailures.length
+            ? {
+                _parseWarning: `Stored analysis for these fields is corrupt and could not be read: ${parseFailures.join(
+                  ", "
+                )}. The data exists but is unreadable — tell the user to re-run 'Analyse with AI' on this video. Do NOT report these fields as empty.`,
+              }
+            : {}),
         };
+        return { ok: true, data };
       }
       case "get_platform_help": {
         const topic =
@@ -970,8 +1040,14 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
 
 export function buildSystemPrompt(
   activeGroups: ToolGroup[],
-  opts: { advisorEnabled?: boolean } = {}
+  opts: { advisorEnabled?: boolean; webSearchAvailable?: boolean } = {}
 ): string {
+  // Web search is Anthropic-server-side and only wired for Claude turns; on
+  // Gemini it's a silent no-op. The caller passes which provider is active so
+  // we can tell the model the TRUTH instead of advertising a tool it can't
+  // use (which made it confidently answer from stale memory). Default true to
+  // preserve behaviour for callers that don't specify.
+  const webSearchAvailable = opts.webSearchAvailable !== false;
   const channel = getChannel();
   const bound = getSetting("youtube.channelId");
   // Pull the full list of connected channels too — when the user has
@@ -1078,9 +1154,16 @@ export function buildSystemPrompt(
     `# Your complete tool arsenal`,
     `Every tool below is **enabled by default in every chat session**. You don't have to ask permission; you don't have to wait for the user to toggle anything. If you decide a tool is right for the question, call it. Most local tools are free and fast; the few that cost API quota are labelled.`,
     ``,
-    `## Web search (always on for Claude turns)`,
-    `- **\`web_search\`** — Anthropic-managed server-side search. You get titled results + URLs + snippets back inside the same turn. Use for: current trends, what a specific named channel/creator is doing, news, niche facts, definitions, anything that lives on the public internet outside the user's local DB. Cap yourself at ~3 searches per question — if 3 well-phrased queries don't surface the answer, ask the user instead of grinding.`,
-    `  → If the chat is running on a Gemini model, web_search is silently disabled (Gemini SDK doesn't compose grounding with function tools yet). When you notice you'd like to search but the tool isn't returning anything, tell the user to switch to a Claude model in the header to enable web search.`,
+    ...(webSearchAvailable
+      ? [
+          `## Web search (ON for this turn)`,
+          `- **\`web_search\`** — Anthropic-managed server-side search. You get titled results + URLs + snippets back inside the same turn. Use for: current trends, what a specific named channel/creator is doing, news, niche facts, definitions, anything that lives on the public internet outside the user's local DB. Cap yourself at ~3 searches per question — if 3 well-phrased queries don't surface the answer, ask the user instead of grinding.`,
+        ]
+      : [
+          `## Web search (OFF for this turn)`,
+          `- **web_search is NOT available right now** — this chat is running on a Gemini model, which can't compose web search with the local tools. Do NOT claim you searched the web, and do NOT answer public/current-events questions from memory (your training data may be stale).`,
+          `  → When a question needs live public information you can't get from the local tools, either (a) tell the user to switch the model picker in the header to **Claude** to enable web search, or (b) ask them to provide the fact. Never fabricate it.`,
+        ]),
     ``,
     `## Local DB — the user's own channel (free, instant, channel-scoped)`,
     `- **\`channel_summary\`** — top-line stats for the active channel: title, subs, total views, video count + average views/likes/comments. Call this first when the user asks anything about "my channel" in the abstract.`,
@@ -1181,7 +1264,9 @@ export function buildSystemPrompt(
     `## When you don't have the data — exactly two moves`,
     `Never invent. Pick one of:`,
     `1. **Ask the user.** Use when the missing piece is something only they know — preferences, goals, target audience, what they've tried, channel theme nuance, language of the videos.`,
-    `2. **\`web_search\` it.** Use when the missing piece is public / factual — current trends, what a named external channel is doing, a niche stat, news, what a term means. Cap at ~3 searches per question; if 3 well-phrased queries don't surface the answer, fall back to option 1.`,
+    webSearchAvailable
+      ? `2. **\`web_search\` it.** Use when the missing piece is public / factual — current trends, what a named external channel is doing, a niche stat, news, what a term means. Cap at ~3 searches per question; if 3 well-phrased queries don't surface the answer, fall back to option 1.`
+      : `2. **web_search is OFF on this (Gemini) model.** You cannot look things up on the web this turn. For public/factual gaps, either ask the user for the fact or tell them to switch the model to Claude to enable web search. Never fill the gap from memory.`,
     `These are your ONLY two moves when data is missing. Guessing, paraphrasing from training memory, or filling in plausible-sounding numbers is forbidden.`
   );
 

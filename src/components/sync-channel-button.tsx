@@ -44,8 +44,10 @@ export function SyncChannelButton({ onSynced }: { onSynced: () => void }) {
       const res = await fetch("/api/youtube/sync", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        // Empty body → the endpoint falls back to the saved channel
-        // binding (youtube.channelInput), i.e. the active channel.
+        // Empty body → the endpoint syncs the ACTIVE channel (it resolves
+        // the active channel's own binding server-side). We deliberately do
+        // NOT pass an input here, so this always re-syncs whatever channel
+        // the user is currently viewing — never a different one.
         body: "{}",
       });
 

@@ -33,7 +33,17 @@ const DATA_DIR = process.env.DATA_DIR
   : path.join(PROJECT_ROOT, "data");
 const DB_PATH = path.join(DATA_DIR, "app.db");
 
-if (!fs.existsSync(DATA_DIR)) {
+// Detect Next.js production-build phase early — needed both for the :memory:
+// DB swap below AND to skip on-disk data-dir creation here. During
+// `next build` (Turbopack) `__dirname` resolves to a virtual "/ROOT/..."
+// path, so findProjectRoot can't locate package.json and DATA_DIR points at
+// an unwritable location; an unconditional mkdir there crashed page-data
+// collection. We use a throwaway :memory: DB in build phase anyway, so the
+// on-disk folder isn't needed then — skip it. Runtime (dev/start) is
+// unaffected: isBuildPhase is false, so the dir is created exactly as before.
+const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
+
+if (!isBuildPhase && !fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
@@ -57,9 +67,9 @@ declare global {
  * Every module-level CREATE/ALTER below is idempotent on a fresh
  * memory DB (CREATE IF NOT EXISTS, ALTER wrapped in try/catch), so
  * the same code path handles both modes.
+ *
+ * (`isBuildPhase` is defined above, next to the data-dir guard.)
  */
-const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
-
 export const db =
   global.__sqlite ?? new Database(isBuildPhase ? ":memory:" : DB_PATH);
 if (!global.__sqlite) {

@@ -43,10 +43,9 @@ const MAX_TOOL_ITERATIONS = 12;
 // the model from burning iterations re-calling a broken tool.
 const TOOL_FAILURE_LOCK_AT = 2;
 
-// Note: "strategy" is intentionally excluded here — it's enabled by
-// default further down. The chat UI's "+" picker treats it as required
-// for ideation flows. Adding it to this allow-list too would double-
-// register the toolset whenever the picker passes it through.
+// Every tool group the chat can use. This is the COMPLETE set — the model
+// is given all of them on every turn (see activeGroups below). The system
+// prompt advertises this exact arsenal, so the two must stay in sync.
 const ALLOWED_GROUPS: ToolGroup[] = [
   "youtube",
   "analytics",
@@ -58,6 +57,21 @@ const ALLOWED_GROUPS: ToolGroup[] = [
 
 function encodeSSE(data: unknown): Uint8Array {
   return new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+// Tool results can be huge (10 transcripts, a 200-row SQL dump). We cap what
+// we feed back into the model's context, but NEVER silently — a bare slice
+// makes the model reason on half a dataset believing it's complete. Append an
+// explicit marker so it knows data was cut and can narrow the next call.
+function truncateForModel(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const omitted = s.length - max;
+  return (
+    s.slice(0, max) +
+    `\n\n…[TRUNCATED ${omitted.toLocaleString("en-US")} of ${s.length.toLocaleString(
+      "en-US"
+    )} characters — the result was cut to fit the context budget. Narrow the query (add filters / a tighter LIMIT) or request a specific subset if you need the rest. Do NOT treat this as the complete data.]`
+  );
 }
 
 export async function POST(req: Request) {
@@ -101,8 +115,20 @@ export async function POST(req: Request) {
     );
   }
 
-  const activeGroups: ToolGroup[] = (body.tools ?? [])
-    .filter((g): g is ToolGroup => ALLOWED_GROUPS.includes(g as ToolGroup));
+  // SERVER-AUTHORITATIVE TOOL ACCESS. The chat is designed so the model can
+  // reach every dataset the user can see in the UI — "everything you see, the
+  // chat sees, and more." We therefore enable ALL tool groups on every turn,
+  // regardless of what the client put in `body.tools`. Trusting the client
+  // list was the root cause of the model intermittently claiming it "doesn't
+  // have access" to data: on first paint the "+" picker only fills in its
+  // defaults AFTER the integrations fetch resolves, so a message sent in that
+  // window posted an empty list (→ zero tools, full-arsenal prompt); and a
+  // stale manual toggle would strip core tools while the prompt still
+  // advertised them. The picker remains a UI affordance; it no longer gates
+  // the model's capabilities. Web search availability is handled separately
+  // (Claude-only) and surfaced to the model via the system prompt.
+  const activeGroups: ToolGroup[] = [...ALLOWED_GROUPS];
+  const webSearchAvailable = provider === "claude";
 
   // Resolve attachments against the local DB + decode any inline images.
   // The UI renders the user's plain text, while the model sees text +
@@ -185,7 +211,10 @@ export async function POST(req: Request) {
   }
 
   const tools = getToolsFor(activeGroups);
-  const system = buildSystemPrompt(activeGroups, { advisorEnabled: false });
+  const system = buildSystemPrompt(activeGroups, {
+    advisorEnabled: false,
+    webSearchAvailable,
+  });
 
   // Mark the session as "turn in progress" so the /chat UI can show a
   // "generating…" indicator even after the user navigates away and back,
@@ -239,11 +268,12 @@ export async function POST(req: Request) {
             messages,
             tools,
             maxTokens: MAX_TOKENS,
-            // Built-in web search is always on for Claude turns — Anthropic
-            // handles the fetch server-side and the model decides when to
-            // reach out. On Gemini turns the flag is a silent no-op until
-            // we migrate to a newer SDK (see ai-provider.ts comment).
-            webSearch: true,
+            // Built-in web search: on for Claude turns (Anthropic handles the
+            // fetch server-side and the model decides when to reach out), off
+            // for Gemini turns where the flag is a silent no-op until we
+            // migrate SDKs. The system prompt is built with the SAME flag, so
+            // the model is told the truth about whether it can search.
+            webSearch: webSearchAvailable,
             onText: (text) => {
               iterText += text;
               send({ type: "delta", text });
@@ -348,7 +378,7 @@ export async function POST(req: Request) {
               tool_use_id: tu.id,
               is_error: !result.ok,
               content: result.ok
-                ? JSON.stringify(result.data).slice(0, 50_000)
+                ? truncateForModel(JSON.stringify(result.data), 50_000)
                 : result.error,
             });
           }
@@ -389,12 +419,14 @@ export async function POST(req: Request) {
             apiKey,
             system,
             messages,
-            tools: [], // tools off for synthesis
-            // Web search also off for the synthesis round — by this point
-            // we've spent the research budget on purpose. Letting the
-            // model issue more searches here defeats the "write the
-            // answer now" instruction.
-            webSearch: false,
+            tools: [], // local tools off for synthesis — write the answer now
+            // Keep Anthropic's server-side web_search available in the
+            // synthesis round (Claude only). Local tools are the expensive,
+            // multi-round research budget we're deliberately ending; a single
+            // grounding search while composing the final answer is cheap and
+            // prevents the model from having to omit a fact it knows it needs.
+            // No-op on Gemini, so gate on the same availability flag.
+            webSearch: webSearchAvailable,
             maxTokens: SYNTHESIS_MAX_TOKENS,
             onText: (text) => {
               synthText += text;

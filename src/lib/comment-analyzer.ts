@@ -93,8 +93,13 @@ type AnalyzerOutput = {
 };
 
 function extractJson(text: string): string {
-  const fence = text.match(/```(?:json)?\s*\n([\s\S]+?)\n```/);
-  if (fence) return fence[1].trim();
+  // Prefer a fenced code block if present. Tolerant of a missing leading or
+  // trailing newline inside the fence (```json{…}``` and ```\n{…}\n``` both
+  // match) — the old regex required literal newlines on both sides and fell
+  // through to the brace-span fallback whenever the model omitted them.
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fence && fence[1].trim()) return fence[1].trim();
+  // Otherwise grab the outermost {…} span.
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start >= 0 && end > start) return text.slice(start, end + 1);

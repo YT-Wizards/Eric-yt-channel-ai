@@ -6,8 +6,9 @@ import { db, getActiveChannelId } from "./db";
  *
  * Hard rules:
  *   - Only SELECT / WITH statements
- *   - Only whitelisted tables (videos, channels, transcripts, comments,
- *     chat_sessions, chat_messages)
+ *   - Only whitelisted tables (videos, channels, transcripts, comments).
+ *     Other datasets (competitors, hooks, comment_analysis, …) have their
+ *     own dedicated chat tools and are deliberately NOT exposed to raw SQL.
  *   - Caps rows returned
  *   - Disallows comments + multiple statements (defence-in-depth against
  *     prompt-injected `;DELETE …`)
@@ -32,8 +33,6 @@ const ALLOWED_TABLES = new Set([
   "channels",
   "transcripts",
   "comments",
-  "chat_sessions",
-  "chat_messages",
 ]);
 
 // Columns Claude is allowed to read. Keeps it schema-aware.
@@ -101,6 +100,15 @@ Useful idioms:
 - strftime('%Y-%m', datetime(published_at, 'unixepoch')) for month bucketing
 - AVG/MAX/MIN/COUNT for aggregates
 - json_each(tags) for tag-level analysis
+
+NOT available here (use the dedicated tools instead, NOT raw SQL):
+- competitors / competitor outliers → list_competitors, list_competitor_alerts, competitor_gap_analysis
+- Hook Lab scores → get_hook_stats, list_hook_breakdowns, get_video_hook
+- per-video AI comment analysis → get_comment_analysis
+- Hooks Library → list_saved_hooks
+If you write SELECT … FROM one of those you'll get a "Table not allowed"
+error — that means the data exists but lives behind a dedicated tool, NOT
+that the user has no such data.
 `.trim();
 
 const FORBIDDEN = [
@@ -120,8 +128,12 @@ const FORBIDDEN = [
   // past the FORBIDDEN regexes.
   /--/,
   /\/\*/,
-  // No multiple statements
-  /;.+/,
+  // No multiple statements: reject a semicolon followed by more SQL. A
+  // bare trailing `;` (optionally followed by whitespace) is fine — it's
+  // common and gets stripped before execution. Only `;` + non-whitespace
+  // (a real second statement) is blocked. The old `/;.+/` also rejected a
+  // harmless trailing "; " and broke otherwise-valid queries.
+  /;\s*\S/,
   // No raw access to underlying tables — Claude must go through the CTE
   // shadows. If we let `main.videos` through, it'd skip our channel
   // filter and leak rows from every channel.
@@ -159,7 +171,7 @@ function buildChannelScopeCTEs(): string {
 export function runSelect(
   query: string,
   maxRows = 200
-): { columns: string[]; rows: unknown[][] } {
+): { columns: string[]; rows: unknown[][]; truncated: boolean } {
   const q = query.trim();
   if (!/^\s*(WITH|SELECT)\b/i.test(q)) {
     throw new Error("Only SELECT / WITH statements allowed.");
@@ -204,10 +216,15 @@ export function runSelect(
     scopedQuery = `WITH ${cteBlock}\n${q}`;
   }
 
-  // Enforce row cap by wrapping if no LIMIT present.
+  // Enforce row cap by wrapping if no LIMIT present. We fetch one MORE than
+  // the cap so we can tell the caller whether the result was actually
+  // truncated (vs landing exactly on the cap by coincidence) and flag it —
+  // otherwise the model reasons on a silently-clipped result believing it's
+  // the whole picture.
+  const fetchCap = maxRows + 1;
   const withLimit = /\bLIMIT\s+\d+/i.test(scopedQuery)
     ? scopedQuery
-    : `SELECT * FROM (${scopedQuery.replace(/;+\s*$/, "")}) LIMIT ${maxRows}`;
+    : `SELECT * FROM (${scopedQuery.replace(/;+\s*$/, "")}) LIMIT ${fetchCap}`;
 
   // 3 `?` placeholders — one per CTE definition — all bound to the same
   // active channel id.
@@ -215,5 +232,6 @@ export function runSelect(
   stmt.raw(true);
   const rows = stmt.all(activeChannelId, activeChannelId, activeChannelId) as unknown[][];
   const columns = stmt.columns().map((c) => c.name);
-  return { columns, rows: rows.slice(0, maxRows) };
+  const truncated = rows.length > maxRows;
+  return { columns, rows: rows.slice(0, maxRows), truncated };
 }
