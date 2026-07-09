@@ -415,11 +415,37 @@ function FiltersRow({
   );
 }
 
-/** SSE progress state for the "Detect thumbnail text" (OCR) button. */
-type OcrPhase =
-  | { kind: "idle"; pending: number }
-  | { kind: "running"; done: number; total: number }
-  | { kind: "error"; message: string };
+/**
+ * Server-side job state for the "Detect thumbnail text" (OCR) batch —
+ * mirrors the shape POSTed/GETed from /api/videos/thumbnails-ocr. The
+ * batch itself runs entirely on the server (fire-and-forget); this
+ * component only ever polls for progress, so navigating away and back
+ * mid-job is safe and shows correct progress purely from the GET.
+ */
+type OcrJob = {
+  running: boolean;
+  done: number;
+  failed: number;
+  total: number;
+  startedAt: number;
+  finishedAt?: number;
+  lastError?: string | null;
+};
+
+/** Server-side job state for the "Auto-categorize" batch — mirrors the
+ * shape POSTed/GETed from /api/videos/categorize. */
+type CategorizeJob = {
+  running: boolean;
+  startedAt: number;
+  finishedAt?: number;
+  ok?: boolean;
+  categories?: string[];
+  assigned?: number;
+  skipped?: number;
+  error?: string;
+};
+
+const JOB_POLL_MS = 2000;
 
 function VideosHeader({
   onSynced,
@@ -428,8 +454,9 @@ function VideosHeader({
   onSynced: () => void;
   onCategorized: () => void;
 }) {
-  const [ocr, setOcr] = useState<OcrPhase>({ kind: "idle", pending: 0 });
-  const [categorizing, setCategorizing] = useState(false);
+  const [ocrPending, setOcrPending] = useState(0);
+  const [ocrJob, setOcrJob] = useState<OcrJob | null>(null);
+  const [catJob, setCatJob] = useState<CategorizeJob | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // YouTube API quota used today — fetched once on mount, purely
@@ -446,100 +473,149 @@ function VideosHeader({
       });
   }, []);
 
-  const refreshOcrPending = useCallback(async () => {
+  const refreshOcr = useCallback(async () => {
     try {
       const r = await fetch("/api/videos/thumbnails-ocr", { cache: "no-store" });
-      const d = (await r.json()) as { pending?: number };
-      setOcr((prev) =>
-        prev.kind === "running" ? prev : { kind: "idle", pending: d.pending ?? 0 }
-      );
+      const d = (await r.json()) as { pending?: number; job?: OcrJob | null };
+      setOcrPending(d.pending ?? 0);
+      setOcrJob(d.job ?? null);
     } catch {
       /* keep current */
     }
   }, []);
 
+  const refreshCategorize = useCallback(async () => {
+    try {
+      const r = await fetch("/api/videos/categorize", { cache: "no-store" });
+      const d = (await r.json()) as { job?: CategorizeJob | null };
+      setCatJob(d.job ?? null);
+    } catch {
+      /* keep current */
+    }
+  }, []);
+
+  // On mount, fetch both GETs once so a fresh page load (or returning to
+  // this tab mid-job) immediately shows correct progress from server state.
   useEffect(() => {
-    refreshOcrPending();
-  }, [refreshOcrPending]);
+    refreshOcr();
+    refreshCategorize();
+  }, [refreshOcr, refreshCategorize]);
+
+  // While the OCR job is running, poll its GET every 2s. The server keeps
+  // working regardless of whether we're polling — that's the point — so
+  // this effect's cleanup just stops the interval, it doesn't touch the job.
+  useEffect(() => {
+    if (!ocrJob?.running) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const r = await fetch("/api/videos/thumbnails-ocr", { cache: "no-store" });
+        const d = (await r.json()) as { pending?: number; job?: OcrJob | null };
+        if (cancelled) return;
+        setOcrPending(d.pending ?? 0);
+        setOcrJob(d.job ?? null);
+        if (d.job && !d.job.running) {
+          onSynced(); // refresh the table with newly-OCR'd text
+        }
+      } catch {
+        /* transient */
+      }
+    };
+    const id = window.setInterval(tick, JOB_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [ocrJob?.running, onSynced]);
+
+  // Same polling idiom for the categorize job.
+  useEffect(() => {
+    if (!catJob?.running) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const r = await fetch("/api/videos/categorize", { cache: "no-store" });
+        const d = (await r.json()) as { job?: CategorizeJob | null };
+        if (cancelled) return;
+        setCatJob(d.job ?? null);
+        if (d.job && !d.job.running) {
+          if (d.job.ok === false) {
+            setError(d.job.error ?? "Categorize failed");
+          } else {
+            onCategorized();
+          }
+        }
+      } catch {
+        /* transient */
+      }
+    };
+    const id = window.setInterval(tick, JOB_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [catJob?.running, onCategorized]);
 
   const runOcr = useCallback(async () => {
     setError(null);
-    setOcr({ kind: "running", done: 0, total: 0 });
     try {
       const res = await fetch("/api/videos/thumbnails-ocr", { method: "POST" });
-      if (!res.ok || !res.body) {
-        const data = (await res.json().catch(() => ({}))) as { error?: string };
-        setError(data.error ?? `OCR failed (HTTP ${res.status})`);
-        await refreshOcrPending();
+      const data = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        started?: boolean;
+        total?: number;
+      };
+      if (res.status === 409) {
+        // Already running server-side — just start polling for it.
+        await refreshOcr();
         return;
       }
-
-      // Read the SSE stream — same idiom as SyncChannelButton: each event
-      // is a `data: {...}\n\n` chunk.
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const chunks = buffer.split("\n\n");
-        buffer = chunks.pop() ?? "";
-        for (const chunk of chunks) {
-          const line = chunk.trim();
-          if (!line.startsWith("data:")) continue;
-          let event: Record<string, unknown>;
-          try {
-            event = JSON.parse(line.slice(5).trim());
-          } catch {
-            continue;
-          }
-          switch (event.type) {
-            case "start":
-              setOcr({ kind: "running", done: 0, total: Number(event.total ?? 0) });
-              break;
-            case "progress":
-              setOcr({
-                kind: "running",
-                done: Number(event.done ?? 0),
-                total: Number(event.total ?? 0),
-              });
-              break;
-            case "done":
-              onSynced(); // refresh the table with newly-OCR'd text
-              break;
-          }
-        }
+      if (!res.ok || !data.started) {
+        setError(data.error ?? `OCR failed (HTTP ${res.status})`);
+        await refreshOcr();
+        return;
       }
-      await refreshOcrPending();
+      // Optimistically reflect "running" immediately; the poll effect
+      // above (keyed on ocrJob?.running) takes over from here.
+      setOcrJob({
+        running: true,
+        done: 0,
+        failed: 0,
+        total: data.total ?? 0,
+        startedAt: Date.now(),
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "OCR failed");
-      await refreshOcrPending();
+      await refreshOcr();
     }
-  }, [onSynced, refreshOcrPending]);
+  }, [refreshOcr]);
 
   const runCategorize = useCallback(async () => {
     setError(null);
-    setCategorizing(true);
     try {
       const r = await fetch("/api/videos/categorize", { method: "POST" });
-      const d = (await r.json().catch(() => ({}))) as { ok?: boolean; error?: string };
-      if (!r.ok || !d.ok) {
+      const d = (await r.json().catch(() => ({}))) as {
+        ok?: boolean;
+        started?: boolean;
+        error?: string;
+      };
+      if (r.status === 409) {
+        // Already running server-side — just start polling for it.
+        await refreshCategorize();
+        return;
+      }
+      if (!r.ok || !d.started) {
         setError(d.error ?? `Categorize failed (HTTP ${r.status})`);
         return;
       }
-      onCategorized();
+      setCatJob({ running: true, startedAt: Date.now() });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Categorize failed");
-    } finally {
-      setCategorizing(false);
     }
-  }, [onCategorized]);
+  }, [refreshCategorize]);
 
-  const ocrRunning = ocr.kind === "running";
-  const ocrPending = ocr.kind === "idle" ? ocr.pending : null;
+  const ocrRunning = ocrJob?.running ?? false;
+  const catRunning = catJob?.running ?? false;
 
   return (
     <div className="space-y-2">
@@ -590,23 +666,23 @@ function VideosHeader({
             <ScanText className="h-3.5 w-3.5" />
           )}
           {ocrRunning
-            ? `OCR ${ocr.done}/${ocr.total}…`
-            : `Detect thumbnail text (${ocrPending ?? 0} pending)`}
+            ? `OCR ${(ocrJob?.done ?? 0) + (ocrJob?.failed ?? 0)}/${ocrJob?.total ?? 0}…`
+            : `Detect thumbnail text (${ocrPending} pending)`}
         </Button>
         <Button
           variant="outline"
           size="sm"
           onClick={runCategorize}
-          disabled={categorizing}
+          disabled={catRunning}
           className="gap-1.5"
           title="Run AI content categorization across the channel's videos."
         >
-          {categorizing ? (
+          {catRunning ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
           ) : (
             <Sparkles className="h-3.5 w-3.5" />
           )}
-          {categorizing ? "Categorizing…" : "Auto-categorize"}
+          {catRunning ? "Categorizing…" : "Auto-categorize"}
         </Button>
       </div>
       {error && (

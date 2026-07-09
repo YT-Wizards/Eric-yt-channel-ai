@@ -3207,6 +3207,33 @@ db.exec(`
     FOREIGN KEY (competitor_id) REFERENCES competitors(id) ON DELETE CASCADE
   );
   CREATE INDEX IF NOT EXISTS idx_comp_alerts_unread ON competitor_alerts(read_at, detected_at DESC);
+
+  -- Ownership junction: which own channel(s) a competitor row "belongs"
+  -- to. Deliberately NOT a column on 'competitors' — that table's
+  -- 'channel_id' is the COMPETITOR's own YouTube id and already carries
+  -- a UNIQUE constraint, so it can't double as an owner pointer, and a
+  -- single competitor may legitimately be tracked by more than one of
+  -- the user's own channels (junction lets that be a second row instead
+  -- of a conflict).
+  --
+  -- VISIBILITY RULE (see COMPETITOR_VISIBILITY_JOIN below): a competitor
+  -- is visible to the active own channel when EITHER (a) it has zero
+  -- rows here at all — a legacy/global row from before per-channel
+  -- tracking existed, or added via a path that doesn't link ownership —
+  -- OR (b) it has a row here matching the active channel. This is what
+  -- gives existing competitor rows back-compat "visible everywhere"
+  -- behaviour while new, channel-owned competitors stay scoped to the
+  -- channel that added them. When no active channel is set at all,
+  -- every competitor is visible (pre-multi-channel / fresh-install
+  -- behaviour, unchanged).
+  CREATE TABLE IF NOT EXISTS competitor_owners (
+    competitor_id INTEGER NOT NULL,
+    owner_channel_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (competitor_id, owner_channel_id),
+    FOREIGN KEY (competitor_id) REFERENCES competitors(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_competitor_owners_channel ON competitor_owners(owner_channel_id);
 `);
 
 // Second alert flavour: "fresh" outliers (views-in-first-hours, caught
@@ -3279,10 +3306,83 @@ export type CompetitorAlert = {
   age_hours: number | null;
 };
 
+/**
+ * Reusable visibility fragment implementing the per-own-channel rule
+ * described on `competitor_owners` above: a competitor row (aliased `c`
+ * in the query it's spliced into) is visible when it has NO ownership
+ * rows at all (legacy/global — NULL-ish by absence, hence "legacy-NULL
+ * rule") OR it has an ownership row for the active channel. Written as
+ * a correlated NOT EXISTS / EXISTS pair rather than a LEFT JOIN so it
+ * works standalone in a WHERE clause without the caller needing to
+ * also dedupe multi-row joins.
+ *
+ * `?` is a single bind parameter for the active channel id — callers
+ * must pass it every time this fragment appears in their SQL, in
+ * positional order. When there's no active channel, callers should
+ * skip this fragment entirely (see `getActiveChannelId()` check at each
+ * call site) so every competitor stays visible, matching pre-multi-
+ * channel behaviour.
+ */
+const COMPETITOR_VISIBILITY_JOIN = `(
+  NOT EXISTS (SELECT 1 FROM competitor_owners co WHERE co.competitor_id = c.id)
+  OR EXISTS (
+    SELECT 1 FROM competitor_owners co
+    WHERE co.competitor_id = c.id AND co.owner_channel_id = ?
+  )
+)`;
+
+/**
+ * Link a competitor to an own channel so it becomes channel-owned (only
+ * visible from that channel, once it has at least one such link — see
+ * the visibility rule on `competitor_owners`). INSERT OR IGNORE because
+ * the same competitor may already be linked to this channel (idempotent
+ * re-call) and the table's PK is (competitor_id, owner_channel_id).
+ */
+export function linkCompetitorToChannel(competitorId: number, ownerChannelId: string): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO competitor_owners (competitor_id, owner_channel_id) VALUES (?, ?)`
+  ).run(competitorId, ownerChannelId);
+}
+
+/**
+ * Ensure a competitor is owned by whichever channel is currently active,
+ * if any. No-op when no active channel is set (fresh installs / pre-
+ * multi-channel state) — the competitor stays a legacy/global row,
+ * visible everywhere, which is the correct behaviour there.
+ *
+ * Called at the end of `addCompetitor` so freshly-added competitors
+ * become scoped to the channel that added them. NOTE: the API route's
+ * duplicate-handling path (re-using an existing row via
+ * `getCompetitorByChannelId` when the same competitor channel id is
+ * re-added) does NOT go through `addCompetitor` and so does not call
+ * this helper — duplicate re-adds keep legacy (visible-everywhere)
+ * visibility for that row. The add route can call this helper later if
+ * that duplicate path should also become channel-owned.
+ */
+export function ensureCompetitorOwnedByActiveChannel(competitorId: number): void {
+  const activeId = getActiveChannelId();
+  if (!activeId) return;
+  linkCompetitorToChannel(competitorId, activeId);
+}
+
 export function listCompetitors(): Competitor[] {
+  // Visibility-scoped to the active own channel: legacy/global rows
+  // (no competitor_owners rows at all) plus rows explicitly owned by
+  // this channel. With no active channel, every competitor is visible
+  // (old behaviour, pre-multi-channel installs).
+  const activeId = getActiveChannelId();
+  if (!activeId) {
+    return db
+      .prepare(`SELECT * FROM competitors ORDER BY added_at DESC`)
+      .all() as Competitor[];
+  }
   return db
-    .prepare(`SELECT * FROM competitors ORDER BY added_at DESC`)
-    .all() as Competitor[];
+    .prepare(
+      `SELECT c.* FROM competitors c
+       WHERE ${COMPETITOR_VISIBILITY_JOIN}
+       ORDER BY c.added_at DESC`
+    )
+    .all(activeId) as Competitor[];
 }
 
 export function getCompetitor(id: number): Competitor | undefined {
@@ -3292,6 +3392,12 @@ export function getCompetitor(id: number): Competitor | undefined {
 }
 
 export function getCompetitorByChannelId(channelId: string): Competitor | undefined {
+  // Plain getter, no visibility filtering and no ownership side effects
+  // by design — this is used by the add-competitor route purely to
+  // detect "is this YouTube channel already tracked at all" so it can
+  // short-circuit a duplicate add. Scoping it to the active channel
+  // would let the same competitor be added twice under two different
+  // own channels, defeating the UNIQUE(channel_id) constraint's intent.
   return db
     .prepare(`SELECT * FROM competitors WHERE channel_id = ?`)
     .get(channelId) as Competitor | undefined;
@@ -3307,7 +3413,11 @@ export function addCompetitor(input: {
       `INSERT INTO competitors (handle, channel_id, title) VALUES (?, ?, ?)`
     )
     .run(input.handle ?? null, input.channel_id ?? null, input.title ?? null);
-  return Number(info.lastInsertRowid);
+  const id = Number(info.lastInsertRowid);
+  // New competitors become owned by whichever channel is active right
+  // now (no-op if none is set — see helper doc above).
+  ensureCompetitorOwnedByActiveChannel(id);
+  return id;
 }
 
 export function updateCompetitorAfterSync(
@@ -3323,9 +3433,73 @@ export function updateCompetitorAfterSync(
   ).run(...values, id);
 }
 
-export function deleteCompetitor(id: number): void {
-  // ON DELETE CASCADE cleans up competitor_videos and competitor_alerts.
-  db.prepare(`DELETE FROM competitors WHERE id = ?`).run(id);
+/**
+ * Delete a competitor — but only outright if it's a legacy/global row
+ * (zero competitor_owners links total). If it's channel-owned:
+ *   - an active channel exists AND holds a link to this competitor:
+ *     remove ONLY that channel's link. The competitor row (and its
+ *     videos/alerts) survive so any OTHER owning channel still sees it.
+ *     The row itself is deleted only once that removal leaves it with
+ *     zero links remaining (i.e. this was its last owner) — never
+ *     delete a still-owned-by-someone-else competitor.
+ *   - no active channel, or the active channel has no link to this
+ *     competitor: nothing to unlink, so fall through to the "delete
+ *     outright" path only if it truly has zero links (legacy); a
+ *     channel-owned competitor with no active channel selected is left
+ *     untouched rather than guessing which owner the caller meant.
+ * ON DELETE CASCADE handles competitor_videos / competitor_alerts /
+ * competitor_owners cleanup whenever the row itself is actually deleted.
+ * Returns true iff the competitor row was deleted; false if only a
+ * link was removed (or nothing happened).
+ */
+export function deleteCompetitor(id: number): boolean {
+  const totalLinks = (
+    db
+      .prepare(`SELECT COUNT(*) AS n FROM competitor_owners WHERE competitor_id = ?`)
+      .get(id) as { n: number }
+  ).n;
+
+  if (totalLinks === 0) {
+    // Legacy/global row — old behaviour, delete outright.
+    const info = db.prepare(`DELETE FROM competitors WHERE id = ?`).run(id);
+    return info.changes > 0;
+  }
+
+  const activeId = getActiveChannelId();
+  if (activeId) {
+    const hadLink =
+      (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM competitor_owners
+             WHERE competitor_id = ? AND owner_channel_id = ?`
+          )
+          .get(id, activeId) as { n: number }
+      ).n > 0;
+    if (hadLink) {
+      db.prepare(
+        `DELETE FROM competitor_owners WHERE competitor_id = ? AND owner_channel_id = ?`
+      ).run(id, activeId);
+      const remaining = (
+        db
+          .prepare(`SELECT COUNT(*) AS n FROM competitor_owners WHERE competitor_id = ?`)
+          .get(id) as { n: number }
+      ).n;
+      if (remaining === 0) {
+        // That was its last owner — the competitor is now orphaned,
+        // so remove the row itself (cascades videos/alerts/owners).
+        const info = db.prepare(`DELETE FROM competitors WHERE id = ?`).run(id);
+        return info.changes > 0;
+      }
+      // Still owned by at least one other channel — unlink only.
+      return false;
+    }
+  }
+
+  // Channel-owned competitor, but either no active channel is set or
+  // the active channel isn't one of its owners — nothing we can safely
+  // unlink or delete on its behalf.
+  return false;
 }
 
 export function upsertCompetitorVideo(v: {
@@ -3544,7 +3718,20 @@ export function recordCompetitorAlert(a: {
 }
 
 export function listCompetitorAlerts(opts: { unreadOnly?: boolean; limit?: number } = {}): (CompetitorAlert & { competitor_title: string | null; competitor_handle: string | null })[] {
-  const where = opts.unreadOnly ? "WHERE a.read_at IS NULL" : "";
+  // Alerts already JOIN to competitors (aliased `c` below) to pull the
+  // title/handle for display, so the per-channel visibility rule slots
+  // straight into the existing WHERE — an alert for a competitor that
+  // isn't visible to the active channel shouldn't surface either.
+  const activeId = getActiveChannelId();
+  const conditions: string[] = [];
+  const args: unknown[] = [];
+  if (opts.unreadOnly) conditions.push("a.read_at IS NULL");
+  if (activeId) {
+    conditions.push(COMPETITOR_VISIBILITY_JOIN);
+    args.push(activeId);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  args.push(opts.limit ?? 100);
   return db
     .prepare(
       `SELECT a.*, c.title AS competitor_title, c.handle AS competitor_handle
@@ -3554,7 +3741,7 @@ export function listCompetitorAlerts(opts: { unreadOnly?: boolean; limit?: numbe
        ORDER BY a.detected_at DESC
        LIMIT ?`
     )
-    .all(opts.limit ?? 100) as (CompetitorAlert & {
+    .all(...args) as (CompetitorAlert & {
     competitor_title: string | null;
     competitor_handle: string | null;
   })[];
@@ -3566,10 +3753,26 @@ export function markCompetitorAlertRead(id: number): void {
   ).run(id);
 }
 
+/** Used by the competitors GET route / sidebar badge. Same per-channel
+ * visibility rule as listCompetitorAlerts — an unread alert for a
+ * competitor hidden from the active channel shouldn't inflate its badge
+ * count. */
 export function unreadCompetitorAlertCount(): number {
+  const activeId = getActiveChannelId();
+  if (!activeId) {
+    const row = db
+      .prepare(`SELECT COUNT(*) AS n FROM competitor_alerts WHERE read_at IS NULL`)
+      .get() as { n: number };
+    return row.n;
+  }
   const row = db
-    .prepare(`SELECT COUNT(*) AS n FROM competitor_alerts WHERE read_at IS NULL`)
-    .get() as { n: number };
+    .prepare(
+      `SELECT COUNT(*) AS n
+       FROM competitor_alerts a
+       JOIN competitors c ON c.id = a.competitor_id
+       WHERE a.read_at IS NULL AND ${COMPETITOR_VISIBILITY_JOIN}`
+    )
+    .get(activeId) as { n: number };
   return row.n;
 }
 
@@ -3623,14 +3826,29 @@ export function competitorGapAnalysis(opts: { topN?: number } = {}): Array<{
 
   // Pull each competitor video's title + views. Aggregate frequency
   // and total views per word; subtract words already in the user's
-  // catalogue at the end.
-  const compVideos = db
-    .prepare(
-      `SELECT title, views FROM competitor_videos
-       ORDER BY views DESC
-       LIMIT 1000`
-    )
-    .all() as { title: string; views: number }[];
+  // catalogue at the end. JOIN to competitors (aliased `c`) so the
+  // per-channel visibility rule can apply — gap analysis for the
+  // active channel must only draw on ITS competitors (legacy/global
+  // ones plus ones explicitly owned by it), not every competitor
+  // tracked across every connected channel.
+  const compVideos = activeId
+    ? (db
+        .prepare(
+          `SELECT cv.title, cv.views
+           FROM competitor_videos cv
+           JOIN competitors c ON c.id = cv.competitor_id
+           WHERE ${COMPETITOR_VISIBILITY_JOIN}
+           ORDER BY cv.views DESC
+           LIMIT 1000`
+        )
+        .all(activeId) as { title: string; views: number }[])
+    : (db
+        .prepare(
+          `SELECT title, views FROM competitor_videos
+           ORDER BY views DESC
+           LIMIT 1000`
+        )
+        .all() as { title: string; views: number }[]);
 
   type Agg = { uses: number; totalViews: number; sampleTitle: string };
   const stats = new Map<string, Agg>();
