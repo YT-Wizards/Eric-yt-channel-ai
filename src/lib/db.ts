@@ -19,6 +19,16 @@ function findProjectRoot(startDir: string): string {
     if (parent === cur) break;
     cur = parent;
   }
+  // Turbopack (Next 16 dev/build) gives bundled modules a VIRTUAL
+  // __dirname like "/ROOT/src/lib" that doesn't exist on disk, so the
+  // walk above finds no package.json and we'd end up trying to mkdir
+  // "/ROOT/src/lib/data" (ENOENT → every DB-backed route 500s). Fall
+  // back to the process working directory: Next is always launched from
+  // the project root, so this still lands the data folder next to
+  // package.json.
+  if (fs.existsSync(path.join(process.cwd(), "package.json"))) {
+    return process.cwd();
+  }
   return startDir;
 }
 
