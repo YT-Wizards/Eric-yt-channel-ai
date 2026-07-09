@@ -307,7 +307,8 @@ async function syncViaYouTubeApi(
     for (const v of videos) {
       if (!v.views) continue;
       const multiplier = v.views / median;
-      if (multiplier >= OUTLIER_MULTIPLIER) {
+      const isMedianOutlier = multiplier >= OUTLIER_MULTIPLIER;
+      if (isMedianOutlier) {
         recordCompetitorAlert({
           competitor_id: competitor.id,
           video_id: v.id,
@@ -318,6 +319,56 @@ async function syncViaYouTubeApi(
           multiplier: Math.round(multiplier * 10) / 10,
         });
         newAlerts++;
+      }
+
+      /* --------------------------------------------------------------
+       * "Fresh outlier" — catches a spike while it's still happening,
+       * instead of waiting for lifetime views to cross 2× median (which
+       * a brand-new upload can't do for days). Mirrors the reference
+       * product's "X views in 4h" alert.
+       *
+       * - Only videos aged 0.5-72h: younger than 30min is too noisy
+       *   (view counts lag on YouTube's end right after publish), older
+       *   than 72h and the lifetime median check above is the better
+       *   signal anyway.
+       * - expectedPace assumes "reasonable" videos reach the channel's
+       *   median over a week (÷168 = hours/week) — that's the bar a
+       *   fresh video needs to beat, not just any nonzero velocity.
+       * - Require 3× that pace (not 1x) so we don't flag ordinary
+       *   variance as a spike — only videos running at 3x the speed
+       *   needed to hit median-in-a-week count as "fresh outlier".
+       * - The `views >= max(1000, 0.1 * median)` floor keeps tiny
+       *   channels/videos (a handful of views in the first minutes)
+       *   from tripping the ratio purely on small numbers.
+       * - Skip if it already qualifies as a median outlier — that's
+       *   the stronger, confirmed signal, and letting fresh fire too
+       *   would just overwrite the median alert row on the
+       *   (competitor_id, video_id) upsert.
+       * ------------------------------------------------------------ */
+      if (!isMedianOutlier && v.publishedAt) {
+        const ageHours = (Date.now() / 1000 - v.publishedAt) / 3600;
+        if (ageHours >= 0.5 && ageHours <= 72) {
+          const expectedPaceViewsPerHour = median / 168;
+          const vph = v.views / ageHours;
+          if (
+            expectedPaceViewsPerHour > 0 &&
+            vph >= 3 * expectedPaceViewsPerHour &&
+            v.views >= Math.max(1000, 0.1 * median)
+          ) {
+            recordCompetitorAlert({
+              competitor_id: competitor.id,
+              video_id: v.id,
+              title: v.title,
+              thumbnail_url: v.thumbnail ?? `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`,
+              views: v.views,
+              channel_median_views: median,
+              multiplier: Math.round((vph / expectedPaceViewsPerHour) * 10) / 10,
+              kind: "fresh",
+              age_hours: Math.round(ageHours * 10) / 10,
+            });
+            newAlerts++;
+          }
+        }
       }
     }
   }
@@ -416,7 +467,8 @@ async function syncViaApify(
       const vid = extractVideoId(it.url, it.id);
       if (!vid || !it.title || !it.viewCount) continue;
       const multiplier = it.viewCount / median;
-      if (multiplier >= OUTLIER_MULTIPLIER) {
+      const isMedianOutlier = multiplier >= OUTLIER_MULTIPLIER;
+      if (isMedianOutlier) {
         recordCompetitorAlert({
           competitor_id: competitor.id,
           video_id: vid,
@@ -427,6 +479,57 @@ async function syncViaApify(
           multiplier: Math.round(multiplier * 10) / 10,
         });
         newAlerts++;
+      }
+
+      /* --------------------------------------------------------------
+       * "Fresh outlier" — catches a spike while it's still happening,
+       * instead of waiting for lifetime views to cross 2× median (which
+       * a brand-new upload can't do for days). Mirrors the reference
+       * product's "X views in 4h" alert.
+       *
+       * - Only videos aged 0.5-72h: younger than 30min is too noisy
+       *   (view counts lag on YouTube's end right after publish), older
+       *   than 72h and the lifetime median check above is the better
+       *   signal anyway.
+       * - expectedPace assumes "reasonable" videos reach the channel's
+       *   median over a week (÷168 = hours/week) — that's the bar a
+       *   fresh video needs to beat, not just any nonzero velocity.
+       * - Require 3× that pace (not 1x) so we don't flag ordinary
+       *   variance as a spike — only videos running at 3x the speed
+       *   needed to hit median-in-a-week count as "fresh outlier".
+       * - The `views >= max(1000, 0.1 * median)` floor keeps tiny
+       *   channels/videos (a handful of views in the first minutes)
+       *   from tripping the ratio purely on small numbers.
+       * - Skip if it already qualifies as a median outlier — that's
+       *   the stronger, confirmed signal, and letting fresh fire too
+       *   would just overwrite the median alert row on the
+       *   (competitor_id, video_id) upsert.
+       * ------------------------------------------------------------ */
+      const publishedAt = parseDate(it.date);
+      if (!isMedianOutlier && publishedAt) {
+        const ageHours = (Date.now() / 1000 - publishedAt) / 3600;
+        if (ageHours >= 0.5 && ageHours <= 72) {
+          const expectedPaceViewsPerHour = median / 168;
+          const vph = it.viewCount / ageHours;
+          if (
+            expectedPaceViewsPerHour > 0 &&
+            vph >= 3 * expectedPaceViewsPerHour &&
+            it.viewCount >= Math.max(1000, 0.1 * median)
+          ) {
+            recordCompetitorAlert({
+              competitor_id: competitor.id,
+              video_id: vid,
+              title: it.title,
+              thumbnail_url: `https://i.ytimg.com/vi/${vid}/mqdefault.jpg`,
+              views: it.viewCount,
+              channel_median_views: median,
+              multiplier: Math.round((vph / expectedPaceViewsPerHour) * 10) / 10,
+              kind: "fresh",
+              age_hours: Math.round(ageHours * 10) / 10,
+            });
+            newAlerts++;
+          }
+        }
       }
     }
   }

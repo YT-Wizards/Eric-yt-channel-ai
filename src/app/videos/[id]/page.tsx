@@ -692,10 +692,70 @@ function TranscriptPanel({
           </div>
         )}
         <div className="max-h-[60vh] overflow-y-auto whitespace-pre-wrap rounded-md border border-border bg-muted/30 p-4 text-sm leading-relaxed">
-          {highlighted}
+          {/* Hook-zone highlighting only applies when no search query is
+              active. `highlighted` (from useHighlightedText) already
+              splits the text into <mark>/<span> segments once a query is
+              typed, and re-splicing a word-count-based hook zone on top
+              of those segments would need to walk across segment
+              boundaries — real complexity for a small highlight. So we
+              keep the two mutually exclusive: hook zone on the plain
+              transcript, search highlighting once you start typing. */}
+          {query.trim() === "" ? (
+            <HookZoneTranscript text={transcript?.text ?? ""} />
+          ) : (
+            highlighted
+          )}
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+// ~2.5 words/sec is a typical spoken-word pace, so 90s of hook zone is
+// roughly this many words into the (timestamp-less) plain-text transcript.
+const HOOK_ZONE_WORD_COUNT = Math.round(2.5 * 90); // 225
+
+/**
+ * Renders the transcript with its first ~90s (by word count) visually
+ * called out as the "hook zone" — the stretch of script that determines
+ * whether a viewer keeps watching. Falls back to plain text when the
+ * transcript is too short to bother splitting.
+ */
+function HookZoneTranscript({ text }: { text: string }) {
+  const { hookZone, rest } = useMemo(() => {
+    const words = text.split(/\s+/).filter(Boolean);
+    if (words.length <= HOOK_ZONE_WORD_COUNT) {
+      return { hookZone: text, rest: "" };
+    }
+    // Re-derive both halves from the original string (rather than
+    // rejoining `words` with single spaces) so whitespace/formatting in
+    // the rest of the transcript is preserved exactly as before.
+    let count = 0;
+    let splitIndex = text.length;
+    const wsRe = /\S+/g;
+    let m: RegExpExecArray | null;
+    while ((m = wsRe.exec(text)) !== null) {
+      count++;
+      if (count === HOOK_ZONE_WORD_COUNT) {
+        splitIndex = m.index + m[0].length;
+        break;
+      }
+    }
+    return { hookZone: text.slice(0, splitIndex), rest: text.slice(splitIndex) };
+  }, [text]);
+
+  if (!rest) return <>{hookZone}</>;
+
+  return (
+    <>
+      <div className="mb-3 rounded-md border-l-4 border-amber-500 bg-amber-500/10 p-3">
+        <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-400">
+          Hook zone · ~first 90s
+        </div>
+        <div>{hookZone}</div>
+      </div>
+      {rest}
+    </>
   );
 }
 

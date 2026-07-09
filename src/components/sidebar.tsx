@@ -16,6 +16,7 @@ import {
   Sparkles,
   BarChart3,
   BookmarkPlus,
+  Lightbulb,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { useI18n } from "@/lib/i18n/provider";
@@ -96,6 +97,7 @@ export function Sidebar() {
         { href: "/", label: t.nav.dashboard, icon: LayoutDashboard, badge: 0 },
         { href: "/videos", label: t.nav.videos, icon: Video, badge: 0 },
         { href: "/chat", label: t.nav.chat, icon: MessageSquare, badge: 0 },
+        { href: "/ideation", label: "Ideation", icon: Lightbulb, badge: 0 },
       ],
     },
     {

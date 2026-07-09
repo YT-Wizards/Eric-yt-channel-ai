@@ -3199,6 +3199,32 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_comp_alerts_unread ON competitor_alerts(read_at, detected_at DESC);
 `);
 
+// Second alert flavour: "fresh" outliers (views-in-first-hours, caught
+// before the channel median has even had time to settle) alongside the
+// original median-multiplier kind. `kind` is nullable so every existing
+// row — all detected under the original logic — reads back as the
+// legacy 'median_outlier' type without a backfill; `age_hours` only
+// ever gets set for kind='fresh' rows, since it's meaningless for the
+// median comparison.
+{
+  const compAlertCols = (
+    db.prepare(`PRAGMA table_info(competitor_alerts)`).all() as { name: string }[]
+  ).map((c) => c.name);
+  const newCompAlertColumns: { name: string; type: string }[] = [
+    { name: "kind", type: "TEXT" },
+    { name: "age_hours", type: "REAL" },
+  ];
+  for (const col of newCompAlertColumns) {
+    if (compAlertCols.includes(col.name)) continue;
+    try {
+      db.exec(`ALTER TABLE competitor_alerts ADD COLUMN ${col.name} ${col.type}`);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[db] add competitor_alerts.${col.name} failed (ignored):`, err);
+    }
+  }
+}
+
 export type Competitor = {
   id: number;
   channel_id: string | null;
@@ -3235,6 +3261,12 @@ export type CompetitorAlert = {
   multiplier: number | null;
   detected_at: number;
   read_at: number | null;
+  // NULL means the legacy 'median_outlier' type. 'fresh' = caught via
+  // a views-in-first-hours check instead of the channel median.
+  kind: string | null;
+  // Video age in hours at detection time — only populated for
+  // kind='fresh' alerts.
+  age_hours: number | null;
 };
 
 export function listCompetitors(): Competitor[] {
@@ -3473,15 +3505,21 @@ export function recordCompetitorAlert(a: {
   views?: number | null;
   channel_median_views?: number | null;
   multiplier?: number | null;
+  // Optional so existing callers (median-outlier detection) keep
+  // working unchanged; only the new "fresh outlier" detector passes these.
+  kind?: string | null;
+  age_hours?: number | null;
 }): void {
   db.prepare(
     `INSERT INTO competitor_alerts
-       (competitor_id, video_id, title, thumbnail_url, views, channel_median_views, multiplier)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+       (competitor_id, video_id, title, thumbnail_url, views, channel_median_views, multiplier, kind, age_hours)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(competitor_id, video_id) DO UPDATE SET
        views = excluded.views,
        multiplier = excluded.multiplier,
-       channel_median_views = excluded.channel_median_views`
+       channel_median_views = excluded.channel_median_views,
+       kind = excluded.kind,
+       age_hours = excluded.age_hours`
   ).run(
     a.competitor_id,
     a.video_id,
@@ -3489,7 +3527,9 @@ export function recordCompetitorAlert(a: {
     a.thumbnail_url ?? null,
     a.views ?? null,
     a.channel_median_views ?? null,
-    a.multiplier ?? null
+    a.multiplier ?? null,
+    a.kind ?? null,
+    a.age_hours ?? null
   );
 }
 
@@ -4242,4 +4282,496 @@ export function hookLibraryEntryForComment(
   return db
     .prepare(`SELECT * FROM hooks_library WHERE comment_id = ?`)
     .get(commentId) as HooksLibraryEntry | undefined;
+}
+
+/* ------------------------------------------------------------------ *
+ * Videos: thumbnail OCR text + content category.
+ *
+ * `thumbnail_text` caches the OCR'd text pulled off a video's thumbnail
+ * image (e.g. "3 SECRETS NOBODY TELLS YOU") so we can search/analyze
+ * thumbnail copy without re-running OCR every time. `category` is a
+ * free-text content bucket, either AI-assigned (topic classifier) or
+ * user-assigned from the UI — used to group videos for the category
+ * breakdown widget. Both nullable: most existing videos won't have
+ * either populated until a backfill job runs.
+ * ------------------------------------------------------------------ */
+{
+  const videoCols = (
+    db.prepare(`PRAGMA table_info(videos)`).all() as { name: string }[]
+  ).map((c) => c.name);
+  const newVideoColumns: { name: string; type: string }[] = [
+    { name: "thumbnail_text", type: "TEXT" },
+    { name: "category", type: "TEXT" },
+  ];
+  for (const col of newVideoColumns) {
+    if (videoCols.includes(col.name)) continue;
+    try {
+      db.exec(`ALTER TABLE videos ADD COLUMN ${col.name} ${col.type}`);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(`[db] add videos.${col.name} failed (ignored):`, err);
+    }
+  }
+}
+
+export function updateVideoThumbnailText(
+  videoId: string,
+  text: string | null
+): void {
+  db.prepare(`UPDATE videos SET thumbnail_text = ? WHERE id = ?`).run(
+    text,
+    videoId
+  );
+}
+
+export function setVideoCategory(
+  videoId: string,
+  category: string | null
+): void {
+  db.prepare(`UPDATE videos SET category = ? WHERE id = ?`).run(
+    category,
+    videoId
+  );
+}
+
+/**
+ * Videos in the active channel that still need thumbnail OCR — no text
+ * cached yet but a thumbnail URL exists to OCR from. Powers the backfill
+ * job's work queue. Newest videos first so freshly published content
+ * gets covered before the long tail.
+ */
+export function listVideosMissingThumbnailText(
+  limit = 200
+): Array<{ id: string; title: string; thumbnail_url: string | null }> {
+  const activeId = getActiveChannelId();
+  if (!activeId) return [];
+  return db
+    .prepare(
+      `SELECT id, title, thumbnail_url
+       FROM videos
+       WHERE channel_id = ?
+         AND (thumbnail_text IS NULL OR thumbnail_text = '')
+         AND thumbnail_url IS NOT NULL
+       ORDER BY published_at DESC
+       LIMIT ?`
+    )
+    .all(activeId, limit) as Array<{
+    id: string;
+    title: string;
+    thumbnail_url: string | null;
+  }>;
+}
+
+/**
+ * Distinct categories in use across the active channel's videos, with
+ * counts — feeds the category filter dropdown and the "biggest buckets"
+ * summary. Ordered by count so the most common categories sort first.
+ */
+export function listChannelCategories(): Array<{
+  category: string;
+  count: number;
+}> {
+  const activeId = getActiveChannelId();
+  if (!activeId) return [];
+  return db
+    .prepare(
+      `SELECT category, COUNT(*) AS count
+       FROM videos
+       WHERE channel_id = ? AND category IS NOT NULL
+       GROUP BY category
+       ORDER BY count DESC`
+    )
+    .all(activeId) as Array<{ category: string; count: number }>;
+}
+
+/* ------------------------------------------------------------------ *
+ * Ideation kanban ("ideas").
+ *
+ * One card per video idea, moving left-to-right through a fixed set of
+ * production stages (idea -> research -> script -> voiceover -> editing
+ * -> published). Cards are scoped per-channel and ordered within a
+ * stage by `position` so drag-and-drop reordering in the UI has
+ * somewhere stable to write to. `source_type` + `source_ref` record
+ * where the idea came from (a detected content gap, a competitor
+ * alert, a flagged comment, an AI chat suggestion, or typed in by
+ * hand) so the UI can show provenance; `source_ref` is a free-form
+ * JSON string whose shape depends on `source_type` (e.g. a comment id,
+ * an alert id, a chat message id) rather than its own FK, since the
+ * source table varies. `linked_video_id` is set once the idea actually
+ * ships, letting the UI show "this became video X" instead of leaving
+ * a stale kanban card around forever.
+ * ------------------------------------------------------------------ */
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS ideas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    notes TEXT,
+    stage TEXT NOT NULL DEFAULT 'idea',
+    category TEXT,
+    demand TEXT,
+    source_type TEXT,
+    source_ref TEXT,
+    position INTEGER NOT NULL DEFAULT 0,
+    linked_video_id TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_ideas_channel_stage_position
+    ON ideas(channel_id, stage, position);
+  CREATE INDEX IF NOT EXISTS idx_ideas_channel_created
+    ON ideas(channel_id, created_at DESC);
+`);
+
+export type IdeaStage =
+  | "idea"
+  | "research"
+  | "script"
+  | "voiceover"
+  | "editing"
+  | "published";
+
+const IDEA_STAGES: IdeaStage[] = [
+  "idea",
+  "research",
+  "script",
+  "voiceover",
+  "editing",
+  "published",
+];
+
+export type Idea = {
+  id: number;
+  channel_id: string;
+  title: string;
+  notes: string | null;
+  stage: IdeaStage;
+  category: string | null;
+  demand: "high" | "medium" | "low" | null;
+  source_type: string | null;
+  source_ref: string | null;
+  position: number;
+  linked_video_id: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+function requireActiveChannelId(): string {
+  const activeId = getActiveChannelId();
+  if (!activeId) throw new Error("No active channel selected");
+  return activeId;
+}
+
+/** All ideation cards for the active channel, grouped for the kanban
+ * board: stage first (so callers can bucket by column), then position
+ * within the stage, then newest-first as a tiebreaker. */
+export function listIdeas(): Idea[] {
+  const activeId = requireActiveChannelId();
+  return db
+    .prepare(
+      `SELECT * FROM ideas
+       WHERE channel_id = ?
+       ORDER BY stage, position ASC, created_at DESC`
+    )
+    .all(activeId) as Idea[];
+}
+
+export function createIdea(input: {
+  title: string;
+  notes?: string | null;
+  stage?: IdeaStage;
+  category?: string | null;
+  demand?: "high" | "medium" | "low" | null;
+  source_type?: string | null;
+  source_ref?: string | null;
+}): Idea {
+  const activeId = requireActiveChannelId();
+  const title = input.title.trim();
+  if (!title) throw new Error("Idea title is required");
+  const stage = input.stage ?? "idea";
+  if (!IDEA_STAGES.includes(stage)) {
+    throw new Error(`Invalid idea stage: ${stage}`);
+  }
+
+  const row = db
+    .prepare(
+      `SELECT COALESCE(MAX(position), -1) AS maxPos FROM ideas
+       WHERE channel_id = ? AND stage = ?`
+    )
+    .get(activeId, stage) as { maxPos: number };
+  const position = row.maxPos + 1;
+
+  const info = db
+    .prepare(
+      `INSERT INTO ideas
+         (channel_id, title, notes, stage, category, demand, source_type, source_ref, position)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      activeId,
+      title,
+      input.notes ?? null,
+      stage,
+      input.category ?? null,
+      input.demand ?? null,
+      input.source_type ?? null,
+      input.source_ref ?? null,
+      position
+    );
+  return db
+    .prepare(`SELECT * FROM ideas WHERE id = ?`)
+    .get(Number(info.lastInsertRowid)) as Idea;
+}
+
+export function updateIdea(
+  id: number,
+  patch: Partial<
+    Pick<
+      Idea,
+      | "title"
+      | "notes"
+      | "stage"
+      | "category"
+      | "demand"
+      | "source_type"
+      | "source_ref"
+      | "linked_video_id"
+    >
+  >
+): Idea | null {
+  const activeId = requireActiveChannelId();
+  if (patch.stage !== undefined && !IDEA_STAGES.includes(patch.stage)) {
+    throw new Error(`Invalid idea stage: ${patch.stage}`);
+  }
+  const keys = Object.keys(patch) as (keyof typeof patch)[];
+  if (keys.length === 0) {
+    return (
+      (db
+        .prepare(`SELECT * FROM ideas WHERE id = ? AND channel_id = ?`)
+        .get(id, activeId) as Idea | undefined) ?? null
+    );
+  }
+  const setClause = keys.map((k) => `${k} = ?`).join(", ");
+  const values = keys.map((k) => patch[k] as unknown);
+  db.prepare(
+    `UPDATE ideas SET ${setClause}, updated_at = strftime('%s','now')
+     WHERE id = ? AND channel_id = ?`
+  ).run(...values, id, activeId);
+  return (
+    (db
+      .prepare(`SELECT * FROM ideas WHERE id = ? AND channel_id = ?`)
+      .get(id, activeId) as Idea | undefined) ?? null
+  );
+}
+
+/**
+ * Move a card to a (possibly new) stage + position, renumbering the
+ * target stage's other cards so ordering stays contiguous (0..n-1) and
+ * the moved card lands exactly at the requested slot. Wrapped in a
+ * transaction so a renumber never lands half-applied.
+ */
+export function moveIdea(
+  id: number,
+  stage: IdeaStage,
+  position: number
+): Idea | null {
+  const activeId = requireActiveChannelId();
+  if (!IDEA_STAGES.includes(stage)) {
+    throw new Error(`Invalid idea stage: ${stage}`);
+  }
+
+  const tx = db.transaction(() => {
+    const existing = db
+      .prepare(`SELECT * FROM ideas WHERE id = ? AND channel_id = ?`)
+      .get(id, activeId) as Idea | undefined;
+    if (!existing) return null;
+
+    // Siblings = other cards already in the destination stage, in
+    // their current order. The moved card is spliced back in at the
+    // clamped target index, then everyone gets a fresh 0..n-1 position.
+    const siblings = db
+      .prepare(
+        `SELECT id FROM ideas
+         WHERE channel_id = ? AND stage = ? AND id != ?
+         ORDER BY position ASC`
+      )
+      .all(activeId, stage, id) as { id: number }[];
+
+    const clamped = Math.max(0, Math.min(position, siblings.length));
+    const orderedIds = [
+      ...siblings.slice(0, clamped).map((s) => s.id),
+      id,
+      ...siblings.slice(clamped).map((s) => s.id),
+    ];
+
+    const updatePosition = db.prepare(
+      `UPDATE ideas SET stage = ?, position = ?, updated_at = strftime('%s','now')
+       WHERE id = ? AND channel_id = ?`
+    );
+    orderedIds.forEach((cardId, idx) => {
+      updatePosition.run(stage, idx, cardId, activeId);
+    });
+
+    return db
+      .prepare(`SELECT * FROM ideas WHERE id = ? AND channel_id = ?`)
+      .get(id, activeId) as Idea;
+  });
+
+  return tx();
+}
+
+export function deleteIdea(id: number): boolean {
+  const activeId = requireActiveChannelId();
+  const info = db
+    .prepare(`DELETE FROM ideas WHERE id = ? AND channel_id = ?`)
+    .run(id, activeId);
+  return info.changes > 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * Comment tags — quick one-word labels on cached comments (hook /
+ * objection / question / praise / attack). Lets the user triage a big
+ * comment dump fast: "show me every objection so I can address it in
+ * the next script" or "pull all the hooks people are quoting back at
+ * me". A comment can carry more than one tag, so the PK is the
+ * (comment_id, tag) pair rather than an own id column — re-tagging the
+ * same pair is just a no-op INSERT OR IGNORE, no duplicate rows to
+ * dedupe later.
+ * ------------------------------------------------------------------ */
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS comment_tags (
+    comment_id TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (comment_id, tag)
+  );
+  CREATE INDEX IF NOT EXISTS idx_comment_tags_tag ON comment_tags(tag);
+`);
+
+const COMMENT_TAGS = ["hook", "objection", "question", "praise", "attack"] as const;
+type CommentTag = (typeof COMMENT_TAGS)[number];
+
+function assertValidCommentTag(tag: string): asserts tag is CommentTag {
+  if (!(COMMENT_TAGS as readonly string[]).includes(tag)) {
+    throw new Error(
+      `Invalid comment tag: ${tag}. Must be one of ${COMMENT_TAGS.join(", ")}`
+    );
+  }
+}
+
+export function addCommentTag(commentId: string, tag: string): void {
+  assertValidCommentTag(tag);
+  db.prepare(
+    `INSERT OR IGNORE INTO comment_tags (comment_id, tag) VALUES (?, ?)`
+  ).run(commentId, tag);
+}
+
+export function removeCommentTag(commentId: string, tag: string): void {
+  db.prepare(
+    `DELETE FROM comment_tags WHERE comment_id = ? AND tag = ?`
+  ).run(commentId, tag);
+}
+
+/**
+ * All tags for every comment on a video, keyed by comment id — one
+ * JOIN query so the comment thread UI can annotate each comment with
+ * its tag chips without an N+1 query per comment.
+ */
+export function listCommentTagsForVideo(
+  videoId: string
+): Record<string, string[]> {
+  const rows = db
+    .prepare(
+      `SELECT ct.comment_id AS comment_id, ct.tag AS tag
+       FROM comment_tags ct
+       JOIN comments c ON c.id = ct.comment_id
+       WHERE c.video_id = ?`
+    )
+    .all(videoId) as { comment_id: string; tag: string }[];
+
+  const byComment: Record<string, string[]> = {};
+  for (const row of rows) {
+    (byComment[row.comment_id] ??= []).push(row.tag);
+  }
+  return byComment;
+}
+
+/**
+ * Every comment tagged `tag`, scoped to the active channel via
+ * comments -> videos, newest first. Powers the "all objections" /
+ * "all hooks" triage views.
+ */
+export function listTaggedComments(
+  tag: string,
+  limit = 100
+): Array<{
+  id: string;
+  video_id: string;
+  video_title: string | null;
+  author: string | null;
+  text: string;
+  like_count: number | null;
+  tag: string;
+  published_at: number | null;
+}> {
+  const activeId = getActiveChannelId();
+  if (!activeId) return [];
+  return db
+    .prepare(
+      `SELECT c.id AS id,
+              c.video_id AS video_id,
+              v.title AS video_title,
+              c.author AS author,
+              c.text AS text,
+              c.like_count AS like_count,
+              ct.tag AS tag,
+              c.published_at AS published_at
+       FROM comment_tags ct
+       JOIN comments c ON c.id = ct.comment_id
+       JOIN videos v ON v.id = c.video_id
+       WHERE ct.tag = ? AND v.channel_id = ?
+       ORDER BY c.published_at DESC
+       LIMIT ?`
+    )
+    .all(tag, activeId, limit) as Array<{
+    id: string;
+    video_id: string;
+    video_title: string | null;
+    author: string | null;
+    text: string;
+    like_count: number | null;
+    tag: string;
+    published_at: number | null;
+  }>;
+}
+
+/* ------------------------------------------------------------------ *
+ * YouTube Data API quota day-counter.
+ *
+ * The YouTube Data API resets its quota at midnight Pacific, but all we
+ * need here is "roughly how much have we burned today" so the UI can
+ * warn before a sync trips the daily cap — exact reset-boundary
+ * precision isn't worth the complexity. Piggybacks on the existing
+ * settings key-value table with one key per UTC day
+ * (`yt.quota.usage.<YYYY-MM-DD>`); yesterday's (and every earlier
+ * day's) key just sits there unused afterwards. That's fine — a few
+ * stray settings rows are harmless and not worth writing cleanup code
+ * for.
+ * ------------------------------------------------------------------ */
+
+function youtubeQuotaKeyForToday(): string {
+  const today = new Date().toISOString().slice(0, 10); // UTC YYYY-MM-DD
+  return `yt.quota.usage.${today}`;
+}
+
+export function addYouTubeQuotaUnits(units: number): void {
+  const key = youtubeQuotaKeyForToday();
+  const current = Number(getSetting(key) ?? "0");
+  setSetting(key, String(current + units));
+}
+
+export function getYouTubeQuotaToday(): number {
+  return Number(getSetting(youtubeQuotaKeyForToday()) ?? "0");
 }

@@ -2,6 +2,7 @@ import "server-only";
 import type Anthropic from "@anthropic-ai/sdk";
 import {
   competitorGapAnalysis,
+  createIdea,
   getActiveChannelId,
   getChannel,
   getComment,
@@ -17,7 +18,9 @@ import {
   listCompetitors,
   listHooksLibrary,
   listHooksWithVideos,
+  listIdeas,
   listReplies,
+  listTaggedComments,
   listTopLevelComments,
   listVideos,
   searchComments,
@@ -28,7 +31,15 @@ import {
   recordDeepgramUsage,
   upsertTranscript,
   videoStats,
+  type IdeaStage,
 } from "./db";
+import {
+  channelViewStats,
+  featureImpact,
+  thumbnailLengthBuckets,
+  thumbnailWordStats,
+  topPackages,
+} from "./packaging";
 import {
   fetchComments,
   fetchTrending,
@@ -475,6 +486,62 @@ const STRATEGY_TOOLS: Tool[] = [
       },
     },
   },
+  {
+    name: "list_ideas",
+    description:
+      "List the user's Ideation board — video ideas moving through stages (idea → research → script → voiceover → editing → published). Each card: title, notes, stage, category, demand, source (gap / competitor_alert / comment / chat / manual), created date. Use when the user asks what's planned, what to work on next, or before proposing NEW ideas (don't duplicate what's already on the board).",
+    input_schema: {
+      type: "object",
+      properties: {
+        stage: {
+          type: "string",
+          enum: ["idea", "research", "script", "voiceover", "editing", "published"],
+          description: "Optional filter to one stage.",
+        },
+      },
+    },
+  },
+  {
+    name: "add_idea",
+    description:
+      "Add a video idea card to the user's Ideation board (lands in the chosen stage, default 'idea'). Use this to SAVE ideas you generated so they don't evaporate in chat history — ask the user first unless they explicitly told you to save.",
+    input_schema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        notes: { type: "string" },
+        stage: {
+          type: "string",
+          enum: ["idea", "research", "script", "voiceover", "editing", "published"],
+        },
+        category: { type: "string" },
+        demand: { type: "string", enum: ["high", "medium", "low"] },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "get_packaging_analysis",
+    description:
+      "The Ideation hub's Packaging stats for this channel: top title+thumbnail-text combos with multiplier vs channel average, universal feature impact (numbers/years/prices/all-caps/question/length), thumbnail-word success rates, thumbnail word-count buckets, plus coverage (how many videos have OCR'd thumbnail text). Use for any question about thumbnails, packaging, or 'what title+thumbnail should I use'. Note: thumbnail stats only cover videos whose thumbnails were OCR'd (coverage numbers included).",
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "list_tagged_comments",
+    description:
+      "Comments the user hand-tagged in the Comments tab (tags: hook, objection, question, praise, attack). The user's own curation signal — 'show my tagged objections' or mining hooks the user flagged.",
+    input_schema: {
+      type: "object",
+      properties: {
+        tag: {
+          type: "string",
+          enum: ["hook", "objection", "question", "praise", "attack"],
+        },
+        limit: { type: "number", default: 50 },
+      },
+      required: ["tag"],
+    },
+  },
 ];
 
 export function getToolsFor(groups: ToolGroup[]): Tool[] {
@@ -518,6 +585,10 @@ const CHANNEL_SCOPED_TOOLS = new Set<string>([
   "get_comment_analysis",
   "list_saved_hooks",
   "competitor_gap_analysis",
+  "list_ideas",
+  "add_idea",
+  "get_packaging_analysis",
+  "list_tagged_comments",
 ]);
 
 export async function runTool(name: string, input: ToolInput): Promise<ToolResult> {
@@ -1023,6 +1094,73 @@ export async function runTool(name: string, input: ToolInput): Promise<ToolResul
         };
       }
 
+      case "list_ideas": {
+        const stageFilter =
+          typeof input.stage === "string" ? (input.stage as IdeaStage) : undefined;
+        const ideas = listIdeas();
+        const filtered = stageFilter
+          ? ideas.filter((i) => i.stage === stageFilter)
+          : ideas;
+        return {
+          ok: true,
+          data: filtered.map((i) => ({
+            id: i.id,
+            title: i.title,
+            notes: i.notes,
+            stage: i.stage,
+            category: i.category,
+            demand: i.demand,
+            source: i.source_type,
+            createdAt: i.created_at,
+          })),
+        };
+      }
+      case "add_idea": {
+        const title = String(input.title ?? "").trim();
+        if (!title) return { ok: false, error: "title required" };
+        const STAGES = ["idea", "research", "script", "voiceover", "editing", "published"];
+        if (input.stage !== undefined && !STAGES.includes(String(input.stage))) {
+          return { ok: false, error: `invalid stage: ${input.stage}` };
+        }
+        const DEMANDS = ["high", "medium", "low"];
+        if (input.demand !== undefined && !DEMANDS.includes(String(input.demand))) {
+          return { ok: false, error: `invalid demand: ${input.demand}` };
+        }
+        const idea = createIdea({
+          title,
+          notes: typeof input.notes === "string" ? input.notes : undefined,
+          stage: input.stage as IdeaStage | undefined,
+          category: typeof input.category === "string" ? input.category : undefined,
+          demand: input.demand as "high" | "medium" | "low" | undefined,
+        });
+        return {
+          ok: true,
+          data: { created: idea.id, title: idea.title, stage: idea.stage },
+        };
+      }
+      case "get_packaging_analysis": {
+        // Deliberately NO AI formula call here — a tool must not spawn its own Claude call.
+        return {
+          ok: true,
+          data: {
+            stats: channelViewStats(),
+            topPackages: topPackages(10),
+            featureImpact: featureImpact(),
+            thumbnailWords: thumbnailWordStats(2, 20),
+            thumbnailLengthBuckets: thumbnailLengthBuckets(),
+          },
+        };
+      }
+      case "list_tagged_comments": {
+        const TAGS = ["hook", "objection", "question", "praise", "attack"];
+        const tag = String(input.tag ?? "");
+        if (!TAGS.includes(tag)) {
+          return { ok: false, error: `tag required, one of: ${TAGS.join(", ")}` };
+        }
+        const limit = Math.min(200, Math.max(1, Number(input.limit) || 50));
+        return { ok: true, data: listTaggedComments(tag, limit) };
+      }
+
       default:
         return { ok: false, error: `unknown tool: ${name}` };
     }
@@ -1087,6 +1225,7 @@ export function buildSystemPrompt(
     `- **Dashboard** (\`/\`) — channel overview: top KPIs (subs / views / videos / avg views), Studio analytics widget, today's earnings, multi-channel earnings comparison, tag overview, the All Channels cross-account summary, and (opt-in) the editor-billing card. The user lands here by default.`,
     `- **Videos** (\`/videos\`) — list of every video synced into the local DB, with thumbnails, stats, and per-video pages (\`/videos/[id]\`). Each video page surfaces transcripts, comments, hook analysis, comment AI analysis, and YouTube Analytics retention + traffic. The bulk-transcribe and bulk-comment-sync banners live here.`,
     `- **AI Chat** (\`/chat\`) — this page. The conversation the user is having with you. Multiple sessions in the left rail, model picker (Claude / Gemini variants) in the header, attachment picker for pinning videos/comments to a turn.`,
+    `- **Ideation** (\`/ideation\`) — the idea-to-published pipeline hub. Four tabs: Board (kanban: idea → research → script → voiceover → editing → published), Videos (command table with OCR'd thumbnail text, AI/manual categories, views-per-hour, milestones, CSV/JSON export, thumbnail-OCR + auto-categorize actions), Packaging (which title+thumbnail combos overperform: multipliers, feature impact, thumbnail-word stats), Signals (fresh competitor outliers, content gaps, audience requests — each with AI title generation and one-click add-to-board).`,
     `- **Hook Lab** (\`/hooks\`) — AI-graded breakdown of every video's opening 30-60 seconds. Each hook gets a formula classification (direct_question / statistic / mystery / character_place_date / personal_story / comment_reference / provocation), 7 quality scores (open_loop, value_promise, conflict, specific_language, identification, pacing, benefit, each 1-10), strengths, suggested improvements. Dashboard tab + Rankings tab + per-video cards.`,
     `- **Formula Analyzer** (\`/formula-analyzer\`) — pure-SQL statistical view of the channel's title catalogue: title-length buckets (≤8 / 9-12 / 13-16 / 17+ words) ranked by avg views, individual title words ranked by aggregate views and success rate, top-10 vs bottom-10 video titles.`,
     `- **Hooks Library** (\`/hooks-library\`) — the user's manually-curated bookmark list of comment quotes / hook phrases they intend to reuse as opening lines in future videos. Has status (available / used), score, source video.`,
@@ -1186,6 +1325,10 @@ export function buildSystemPrompt(
     `- **\`competitor_gap_analysis\`** *(topN)* — title keywords frequent in competitors' top videos that the user has NEVER used in any of their own titles. Ranked by aggregate competitor views.`,
     `- **\`list_saved_hooks\`** — Hooks Library entries (comments / quotes the creator bookmarked for future use). Useful when planning a new video to remind the user of unused material they already curated.`,
     `- **\`get_platform_help\`** *(optional topic)* — the YT Channel AI user guide. Call it to answer "how does this app work" questions accurately. Topics: overview, dashboard, videos, hook-lab, formula-analyzer, hooks-library, competitors, chat, integrations, settings, jobs, troubleshooting.`,
+    `- **\`list_ideas\`** *(optional stage filter)* — the user's Ideation board cards (title, notes, stage, category, demand, source, created date). Check this before proposing new ideas so you don't duplicate what's already planned, or when the user asks what's queued up next.`,
+    `- **\`add_idea\`** *(title, optional notes/stage/category/demand)* — saves a video idea onto the Ideation board (default stage "idea"). Use to persist ideas you generated so they don't get lost in chat history; ask the user first unless they explicitly said to save.`,
+    `- **\`get_packaging_analysis\`** — the Ideation Packaging tab's stats: top title+thumbnail-text combos with multiplier vs channel average, universal feature impact (numbers/years/prices/all-caps/question/length), thumbnail-word success rates, thumbnail word-count buckets, and OCR coverage. Use for any thumbnail/packaging question.`,
+    `- **\`list_tagged_comments\`** *(tag: hook|objection|question|praise|attack, limit)* — comments the user hand-tagged in the Comments tab. Use for "show my tagged objections" or mining hooks the user flagged themselves.`,
     ``,
     `## YouTube Data API tools (needs YouTube Data API key, costs quota)`,
     `- **\`get_video_comments\`** *(videoId, max)* — live YouTube comments via the public API. Costs 1 unit per ~100 comments. Use \`list_video_comments_cached\` first when possible — it's free and instant.`,
@@ -1323,6 +1466,8 @@ export function buildSystemPrompt(
     `  - **Estimated demand** — high / medium / low, justified by either comment-request frequency or youtube_suggest volume`,
     ``,
     `**Hard ban:** no "general advice" ideas. If an idea can't cite a specific tool result, drop it. **3 grounded ideas beat 10 generic ones.**`,
+    ``,
+    `**After the user picks ideas they like — offer to save them to the Ideation board via \`add_idea\` (stage "idea", source noted in notes). Saved ideas appear on the /ideation Board tab.**`,
     ``,
     `For other non-trivial questions (audience analysis, retention deep-dives, competitor reports), apply the same skeleton: plan → batch parallel tool calls → synthesise → answer.`
   );

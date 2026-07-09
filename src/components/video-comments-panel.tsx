@@ -46,6 +46,16 @@ type ListResponse = {
 
 const PAGE_SIZE = 50;
 
+/** Quick-tag triage labels — kept in sync with the CHECK-style list in db.ts. */
+const QUICK_TAGS = [
+  { tag: "hook", label: "Hook" },
+  { tag: "objection", label: "Objection" },
+  { tag: "question", label: "Question" },
+  { tag: "praise", label: "Praise" },
+  { tag: "attack", label: "Attack" },
+] as const;
+type QuickTag = (typeof QUICK_TAGS)[number]["tag"];
+
 export function VideoCommentsPanel({
   videoId,
   initialSummary,
@@ -62,6 +72,22 @@ export function VideoCommentsPanel({
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(false);
   const [query, setQuery] = useState("");
+
+  // Quick-tag triage — comment_id -> tag[] for every cached comment on
+  // this video, plus the "All / Hook / Objection / ..." filter pill.
+  const [tagsByComment, setTagsByComment] = useState<Record<string, string[]>>({});
+  const [tagFilter, setTagFilter] = useState<QuickTag | "all">("all");
+
+  const loadTags = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/videos/${videoId}/comment-tags`);
+      if (!res.ok) return;
+      const data = (await res.json()) as { tags?: Record<string, string[]> };
+      setTagsByComment(data.tags ?? {});
+    } catch {
+      /* tag chips are additive — a failed fetch just leaves them empty */
+    }
+  }, [videoId]);
 
   const loadPage = useCallback(
     async (nextOffset: number, replace: boolean) => {
@@ -91,7 +117,40 @@ export function VideoCommentsPanel({
 
   useEffect(() => {
     loadPage(0, true);
-  }, [loadPage]);
+    loadTags();
+  }, [loadPage, loadTags]);
+
+  // Optimistic toggle — flip the chip locally right away, then
+  // POST/DELETE in the background. On failure we roll the local map
+  // back so the chip doesn't lie about server state.
+  const toggleTag = useCallback(
+    async (commentId: string, tag: QuickTag) => {
+      const wasActive = (tagsByComment[commentId] ?? []).includes(tag);
+      setTagsByComment((prev) => {
+        const current = prev[commentId] ?? [];
+        const next = wasActive ? current.filter((tt) => tt !== tag) : [...current, tag];
+        return { ...prev, [commentId]: next };
+      });
+      try {
+        const res = await fetch(`/api/comments/${commentId}/tags`, {
+          method: wasActive ? "DELETE" : "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tag }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch {
+        // Roll back to the pre-toggle state.
+        setTagsByComment((prev) => {
+          const current = prev[commentId] ?? [];
+          const rolledBack = wasActive
+            ? [...current, tag]
+            : current.filter((tt) => tt !== tag);
+          return { ...prev, [commentId]: rolledBack };
+        });
+      }
+    },
+    [tagsByComment]
+  );
 
   const sync = async () => {
     setSyncing(true);
@@ -116,11 +175,17 @@ export function VideoCommentsPanel({
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return comments;
-    return comments.filter(
-      (c) => c.text.toLowerCase().includes(q) || (c.author ?? "").toLowerCase().includes(q)
-    );
-  }, [comments, query]);
+    let rows = comments;
+    if (q) {
+      rows = rows.filter(
+        (c) => c.text.toLowerCase().includes(q) || (c.author ?? "").toLowerCase().includes(q)
+      );
+    }
+    if (tagFilter !== "all") {
+      rows = rows.filter((c) => (tagsByComment[c.id] ?? []).includes(tagFilter));
+    }
+    return rows;
+  }, [comments, query, tagFilter, tagsByComment]);
 
   const fetchedLabel = summary.fetchedAt ? fmtRelative(summary.fetchedAt) : t.comments.neverSynced;
 
@@ -220,6 +285,24 @@ export function VideoCommentsPanel({
   return (
     <Card>
       <CardContent className="p-4">
+        {/* Quick-tag filter pills — client-side filter of already-loaded
+            comments by their tag map, no server round-trip. */}
+        {comments.length > 0 && (
+          <div className="mb-3 flex flex-wrap items-center gap-1.5">
+            <FilterPill active={tagFilter === "all"} onClick={() => setTagFilter("all")}>
+              All
+            </FilterPill>
+            {QUICK_TAGS.map(({ tag, label }) => (
+              <FilterPill
+                key={tag}
+                active={tagFilter === tag}
+                onClick={() => setTagFilter(tag)}
+              >
+                {label}
+              </FilterPill>
+            ))}
+          </div>
+        )}
         {showSyncBanner && (
           <div className="mb-3 flex flex-wrap items-center justify-between gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
             <div className="flex min-w-0 items-start gap-2">
@@ -499,6 +582,8 @@ export function VideoCommentsPanel({
                 comment={c}
                 isSaved={savedHookIds.has(c.id)}
                 onSaveAsHook={() => saveAsHook(c.id, c.text, c.author)}
+                tags={tagsByComment[c.id] ?? []}
+                onToggleTag={(tag) => toggleTag(c.id, tag)}
               />
             ))}
           </ul>
@@ -611,11 +696,15 @@ function CommentItem({
   comment,
   isSaved,
   onSaveAsHook,
+  tags,
+  onToggleTag,
 }: {
   videoId: string;
   comment: Comment;
   isSaved: boolean;
   onSaveAsHook: () => void;
+  tags: string[];
+  onToggleTag: (tag: QuickTag) => void;
 }) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
@@ -766,6 +855,28 @@ function CommentItem({
             </button>
           </div>
 
+          {/* Quick-tag triage chips — toggle hook/objection/question/
+              praise/attack on this comment. When "Hook" is active, the
+              save-as-hook button above is the panel's existing save
+              affordance for exactly this case, so we don't add a second
+              save control here — just call it out. */}
+          <div className="mt-1.5 flex flex-wrap items-center gap-1">
+            {QUICK_TAGS.map(({ tag, label }) => (
+              <TagChip
+                key={tag}
+                active={tags.includes(tag)}
+                onClick={() => onToggleTag(tag)}
+              >
+                {label}
+              </TagChip>
+            ))}
+            {tags.includes("hook") && !isSaved && (
+              <span className="ml-1 text-[10px] text-muted-foreground">
+                Tagged as a hook — consider &ldquo;Save as hook&rdquo; above.
+              </span>
+            )}
+          </div>
+
           {expanded && (
             <div className="mt-3 space-y-3 border-l-2 border-border pl-4">
               {loadingReplies && (
@@ -811,6 +922,58 @@ function CommentItem({
         </div>
       </div>
     </li>
+  );
+}
+
+/** Filter pill for the "All / Hook / Objection / ..." row at the panel top. */
+function FilterPill({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors",
+        active
+          ? "border-primary bg-primary text-primary-foreground"
+          : "border-border text-muted-foreground hover:bg-accent hover:text-foreground"
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+/** Tiny per-comment toggle chip (Hook/Objection/Question/Praise/Attack). */
+function TagChip({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors",
+        active
+          ? "border-primary/60 bg-primary/15 text-primary"
+          : "border-border/60 text-muted-foreground hover:bg-accent hover:text-foreground"
+      )}
+    >
+      {children}
+    </button>
   );
 }
 

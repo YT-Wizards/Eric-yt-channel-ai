@@ -1,4 +1,5 @@
 import "server-only";
+import { addYouTubeQuotaUnits } from "./db";
 
 /**
  * YouTube Data API v3 client — API-key (public data) only.
@@ -9,6 +10,18 @@ import "server-only";
  */
 
 const BASE = "https://www.googleapis.com/youtube/v3";
+
+// Per-request quota cost by API resource (URL path segment). `search.list`
+// is the expensive one at 100 units; every other resource we call here
+// (channels, videos, playlistItems, commentThreads, comments) is 1 unit
+// regardless of `part` count. Anything not listed defaults to 1.
+const QUOTA_COST_BY_PATH: Record<string, number> = {
+  search: 100,
+};
+
+function quotaCostForPath(path: string): number {
+  return QUOTA_COST_BY_PATH[path] ?? 1;
+}
 
 export type ResolvedChannel = {
   id: string;
@@ -55,6 +68,17 @@ async function call<T>(
     if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
   }
   const res = await fetch(url.toString(), { cache: "no-store" });
+
+  // Count-only quota tracking — never allowed to affect the actual call.
+  // A request that reached Google and got any HTTP response (including an
+  // error status) still consumed quota, so we count here rather than only
+  // on success.
+  try {
+    addYouTubeQuotaUnits(quotaCostForPath(path));
+  } catch {
+    /* tracking must never break the underlying API call */
+  }
+
   if (!res.ok) {
     let detail = "";
     try {
