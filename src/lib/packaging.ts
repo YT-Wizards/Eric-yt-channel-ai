@@ -34,7 +34,53 @@ import {
  * Every function here returns an empty/neutral result when there's
  * no active channel — callers (the API route) turn that into a 400
  * instead of the lib layer throwing.
+ *
+ * STATISTICAL HONESTY. Two failure modes were caught with real data
+ * on a live channel and are guarded against below:
+ *   1) TINY-SAMPLE OVERCLAIMING — a word/feature seen only 1-2 times
+ *      can look like a "rule" when really it's riding one outlier
+ *      video (e.g. a word that happens to label the channel's single
+ *      viral topic reads as a huge view-driver when it's actually a
+ *      proxy for the topic, not a causal packaging choice). Guarded
+ *      by per-side minimum-count gates (featureImpact) and a raised
+ *      minUses for anything that feeds the prose formula
+ *      (FORMULA_MIN_USES).
+ *   2) IMMATURITY BIAS — lifetime views of a video published days ago
+ *      are not comparable to a years-old video's lifetime views; every
+ *      recently-used word/feature looks artificially weak next to old
+ *      virals that have had years to accumulate views. Guarded by
+ *      MIN_AGE_DAYS, applied to the prescriptive functions only (see
+ *      below) — NOT to the purely descriptive ones.
  * ============================================================ */
+
+/**
+ * Views of videos younger than this haven't matured; comparing their
+ * lifetime views against old videos poisons word/feature stats (a
+ * video published 3 days ago will almost always look "worse" than one
+ * published 3 years ago purely because it's had less time to
+ * accumulate views, not because its packaging was weaker). Applied to
+ * featureImpact(), thumbnailWordStats(), and thumbnailLengthBuckets()
+ * — the functions whose output gets read as "do this / don't do
+ * that" advice. NOT applied to topPackages() or channelViewStats(),
+ * which describe the catalogue as it is rather than prescribe what to
+ * do next, so including young videos there is honest, not misleading.
+ */
+const MIN_AGE_DAYS = 14;
+
+/**
+ * Unix-seconds cutoff for the maturity filter above — videos with
+ * `published_at` older than (i.e. numerically less than) this value
+ * have had at least MIN_AGE_DAYS to accumulate views. `published_at`
+ * is stored in unix seconds (see sql-tool.ts), matching the
+ * `Math.floor(Date.now() / 1000) - days * 86400` pattern already used
+ * elsewhere in this codebase (e.g. purgeStaleReadCompetitorAlerts in
+ * db.ts). Computed fresh on every call rather than cached as a module
+ * constant so a long-lived server process doesn't serve a stale
+ * cutoff.
+ */
+function matureCutoffUnixSeconds(): number {
+  return Math.floor(Date.now() / 1000) - MIN_AGE_DAYS * 86400;
+}
 
 export type PackageRow = {
   id: string;
@@ -245,8 +291,14 @@ function isAllCaps(s: string): boolean {
  * bucket would just be measuring "was this video ever OCR'd", not a
  * real packaging choice.
  *
- * A feature is only included once both sides have at least 2 videos
- * — below that the delta is just noise from a single outlier.
+ * Two guards against reading noise as a rule (see module header):
+ *   - MATURITY: only videos published >= MIN_AGE_DAYS ago are
+ *     considered, so a feature used mostly on recent uploads doesn't
+ *     look artificially weak against old videos that have had years
+ *     to accumulate views.
+ *   - SAMPLE SIZE: a feature is only included once BOTH sides
+ *     ("has it" and "doesn't") have at least 3 videos — below that
+ *     the delta is just noise from one or two outliers.
  * Sorted by |deltaPct| descending so the strongest signals surface
  * first regardless of direction.
  */
@@ -266,9 +318,10 @@ export function featureImpact(): Array<{
     .prepare(
       `SELECT id, title, thumbnail_text, views
        FROM videos
-       WHERE channel_id = ? AND views IS NOT NULL`
+       WHERE channel_id = ? AND views IS NOT NULL
+         AND published_at IS NOT NULL AND published_at <= ?`
     )
-    .all(activeId) as ThumbRow[];
+    .all(activeId, matureCutoffUnixSeconds()) as ThumbRow[];
   if (allRows.length === 0) return [];
 
   const normalized = allRows.map((r) => ({
@@ -300,7 +353,7 @@ export function featureImpact(): Array<{
       if (check.test(v)) withViews.push(v.views);
       else withoutViews.push(v.views);
     }
-    if (withViews.length < 2 || withoutViews.length < 2) return;
+    if (withViews.length < 3 || withoutViews.length < 3) return;
     const avgWith = withViews.reduce((a, b) => a + b, 0) / withViews.length;
     const avgWithout =
       withoutViews.reduce((a, b) => a + b, 0) / withoutViews.length;
@@ -360,11 +413,27 @@ export type ThumbnailWordStat = {
 };
 
 /**
+ * Minimum uses-per-word for a word to be trusted as a stated,
+ * causal packaging rule (as opposed to a merely-observed data point).
+ * Used to gate what packagingFormulaSummary() feeds Claude — the
+ * table on the Packaging tab still defaults to the looser `minUses`
+ * param below so the UI can show "worth testing" words too; it's only
+ * the prose "winning formula" that requires this stricter bar (see
+ * module header, failure mode 1).
+ */
+export const FORMULA_MIN_USES = 5;
+
+/**
  * Per-word stats across the active channel's thumbnail text — the
  * thumbnail-text mirror of titleWordStats in db.ts. Same "success"
  * definition (views >= channel median x 1.5), same sort (by total
  * views desc, so the most-tested words rank first), same minUses
  * gate. Only covers OCR'd videos (see module header caveat).
+ *
+ * Also applies the MIN_AGE_DAYS maturity filter (see module header,
+ * failure mode 2) — a word used mostly on last week's uploads would
+ * otherwise look like a loser next to words used on years-old virals
+ * that have simply had more time to accumulate views.
  */
 export function thumbnailWordStats(
   minUses = 2,
@@ -373,6 +442,7 @@ export function thumbnailWordStats(
   const activeId = getActiveChannelId();
   if (!activeId) return [];
 
+  const cutoff = matureCutoffUnixSeconds();
   const allViews = activeChannelViewsRows().map((r) => r.views).sort((a, b) => a - b);
   if (allViews.length === 0) return [];
   const successThreshold = median(allViews) * 1.5;
@@ -382,9 +452,10 @@ export function thumbnailWordStats(
       `SELECT id, title, thumbnail_text, views
        FROM videos
        WHERE channel_id = ? AND views IS NOT NULL
-         AND thumbnail_text IS NOT NULL AND thumbnail_text != ''`
+         AND thumbnail_text IS NOT NULL AND thumbnail_text != ''
+         AND published_at IS NOT NULL AND published_at <= ?`
     )
-    .all(activeId) as ThumbRow[];
+    .all(activeId, cutoff) as ThumbRow[];
   if (rows.length === 0) return [];
 
   type Agg = {
@@ -436,6 +507,10 @@ const THUMB_LENGTH_BUCKET_ORDER = ["no text", "1 word", "2-3", "4-6", "7+"] as c
  * "no text" bucket (videos never OCR'd, or OCR'd empty) as the
  * baseline everything else is measured against — without it there'd
  * be no way to tell whether having ANY thumbnail text helps at all.
+ *
+ * Applies the MIN_AGE_DAYS maturity filter (see module header,
+ * failure mode 2) so a bucket that happens to hold mostly-recent
+ * uploads isn't penalized for not having had time to accumulate views.
  */
 export function thumbnailLengthBuckets(): Array<{
   bucket: string;
@@ -454,9 +529,10 @@ export function thumbnailLengthBuckets(): Array<{
     .prepare(
       `SELECT id, title, thumbnail_text, views
        FROM videos
-       WHERE channel_id = ? AND views IS NOT NULL`
+       WHERE channel_id = ? AND views IS NOT NULL
+         AND published_at IS NOT NULL AND published_at <= ?`
     )
-    .all(activeId) as ThumbRow[];
+    .all(activeId, matureCutoffUnixSeconds()) as ThumbRow[];
   if (rows.length === 0) return empty;
 
   const buckets: Record<(typeof THUMB_LENGTH_BUCKET_ORDER)[number], number[]> = {
@@ -496,8 +572,14 @@ export function thumbnailLengthBuckets(): Array<{
 
 type FormulaCacheEntry = { text: string; ts: number };
 
+// v2: bumped when the summary's inputs/prompt changed to enforce
+// statistical honesty (maturity cutoff, raised minUses, mandatory
+// sample-size citations — see module header). Old `packaging.formula.
+// <channelId>` entries are simply never read again under this key;
+// they age out as harmless orphans in the settings table rather than
+// needing an explicit migration/delete.
 function formulaCacheKey(channelId: string): string {
-  return `packaging.formula.${channelId}`;
+  return `packaging.formula.v2.${channelId}`;
 }
 
 /**
@@ -512,6 +594,17 @@ function formulaCacheKey(channelId: string): string {
  * channel or no Claude API key configured, mirroring how
  * analyzeVideoComments (comment-analyzer.ts) reports a soft
  * "can't do this right now" instead of blowing up the route.
+ *
+ * STATISTICAL HONESTY (see module header): every input here is
+ * already filtered/gated before it reaches Claude —
+ * featureImpact/thumbnailWordStats/thumbnailLengthBuckets apply the
+ * MIN_AGE_DAYS maturity cutoff internally, and both word-stat calls
+ * below use FORMULA_MIN_USES (5) instead of the UI's looser default —
+ * but the prompt ALSO has to say so explicitly, because Claude can
+ * still misread a correct-but-small number in the JSON as license for
+ * a confident rule. Hence the instruction below spells out sample-size
+ * citation, a small-sample carve-out, and a mandatory caveats section
+ * rather than trusting pre-filtered data alone.
  */
 export async function packagingFormulaSummary(
   opts: { refresh?: boolean } = {}
@@ -544,25 +637,34 @@ export async function packagingFormulaSummary(
 
   const payload = {
     topPackages: topPackages(10),
-    featureImpact: featureImpact().slice(0, 8),
-    thumbnailWordStats: thumbnailWordStats(2, 15),
-    titleWordStats: titleWordStats({ minUses: 2, topN: 15 }),
+    featureImpact: featureImpact(),
+    thumbnailWordStats: thumbnailWordStats(FORMULA_MIN_USES, 15),
+    titleWordStats: titleWordStats({ minUses: 5, topN: 15 }),
     thumbnailLengthBuckets: thumbnailLengthBuckets(),
   };
 
-  const instruction =
-    "From these REAL statistics of one YouTube channel, write the channel's " +
-    "winning packaging formula: 1) a one-line title structure template with " +
-    "placeholders, 2) a one-line thumbnail-text recipe, 3) 3 short bullet " +
-    "rules citing the numbers. Same language as the sample titles. No " +
-    "generic advice — every claim must reference a stat given.";
+  const instruction = [
+    "From these REAL statistics of one YouTube channel, write the channel's winning packaging formula:",
+    "1) a one-line title structure template with placeholders,",
+    "2) a one-line thumbnail-text recipe,",
+    "3) 3 short bullet rules citing the numbers.",
+    "",
+    "Statistical honesty rules — follow all of them exactly:",
+    "- Every quantitative rule MUST cite its sample size inline, in the form (n=17).",
+    "- NEVER state a causal rule from a word or feature with fewer than 5 uses on each side (e.g. used only 5 times, or with fewer than 5 videos lacking it). Words/features below that bar may only be listed under a separate \"Worth testing (small sample)\" list, named with their use count but WITHOUT view numbers or any performance claim.",
+    "- Prefer title-structure patterns (typically higher n) over thumbnail-word claims (typically lower n) when both are available — lead with what the larger sample supports.",
+    "- Treat word stats as correlated with the video's TOPIC, not proven causes of performance. If a high-performing word is plausibly just naming the topic of one or two big videos rather than a repeatable packaging trick, say so explicitly instead of recommending it as a formula.",
+    "- End with a short mandatory \"Data caveats\" section naming the weakest (smallest-sample or most topic-bound) stats you used above, so the reader knows what to double-check before trusting a rule.",
+    "",
+    "Same language as the channel's titles. No generic advice — every claim must reference a stat given. Keep it tight.",
+  ].join("\n");
 
   const client = new Anthropic({ apiKey });
   let text: string;
   try {
     const response = await client.messages.create({
       model: ANALYZER_MODEL,
-      max_tokens: 600,
+      max_tokens: 800,
       messages: [
         {
           role: "user",

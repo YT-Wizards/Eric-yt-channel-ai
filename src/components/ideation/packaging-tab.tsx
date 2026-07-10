@@ -236,10 +236,16 @@ export function PackagingTab() {
       <Card>
         <CardContent className="p-4">
           <div className="mb-2 flex items-center justify-between gap-2">
-            <h2 className="flex items-center gap-1.5 text-sm font-semibold">
-              <Trophy className="h-3.5 w-3.5" />
-              Winning formula
-            </h2>
+            <div>
+              <h2 className="flex items-center gap-1.5 text-sm font-semibold">
+                <Trophy className="h-3.5 w-3.5" />
+                Winning formula
+              </h2>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">
+                Rules cite sample sizes — small samples are listed as
+                &ldquo;worth testing&rdquo;, not facts.
+              </p>
+            </div>
             {formula !== null && (
               <Button
                 variant="ghost"
@@ -280,7 +286,8 @@ export function PackagingTab() {
             </h2>
             <p className="mb-3 text-[11px] text-muted-foreground">
               For each packaging trait, videos that have it vs. don&rsquo;t —
-              the bar length is the size of the view swing either way.
+              the bar length is the size of the view swing either way. Only
+              features with &ge;3 videos on each side, videos &ge;14 days old.
             </p>
             {featureImpact.length > 0 ? (
               <ul className="space-y-2.5">
@@ -447,12 +454,15 @@ export function PackagingTab() {
             Thumbnail words — ranked by aggregate views
           </h2>
           <p className="mb-3 text-[11px] text-muted-foreground">
-            Every word that appeared in &ge;2 of your OCR&rsquo;d thumbnails.{" "}
+            Every word that appeared in &ge;2 of your OCR&rsquo;d thumbnails,
+            videos &ge;14 days old (younger uploads haven&rsquo;t had time to
+            accumulate views, so they&rsquo;re excluded to keep this fair).{" "}
             <strong>Uses</strong> = how many times you used the word;{" "}
             <strong>Avg views</strong> = average views across videos that
             contained it; <strong>Success</strong> = share of those videos
             that ended up &ge;1.5&times; your channel median (green =
-            consistent winner).
+            consistent winner). Small use-counts can just mean the word
+            names a one-off topic, not a repeatable formula.
           </p>
           {thumbWords.length > 0 ? (
             <div className="overflow-x-auto">
