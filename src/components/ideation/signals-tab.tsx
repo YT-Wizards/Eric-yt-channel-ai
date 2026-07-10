@@ -10,6 +10,7 @@ import {
   Radar,
   RefreshCw,
   Sparkles,
+  X,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -60,6 +61,39 @@ function demandChipClass(demand: "high" | "medium" | "low"): string {
 
 function youtubeUrl(videoId: string): string {
   return `https://www.youtube.com/watch?v=${videoId}`;
+}
+
+// Days above which a competitor outlier is treated as "old but still a
+// proven hit" rather than a live spike — see PROVEN_HIT_DAYS usage below.
+const PROVEN_HIT_DAYS = 30;
+
+/**
+ * Human-friendly "how long ago" for a video's own publish date — mirrors
+ * the `fmtRelative` idiom in src/app/videos/page.tsx, but (unlike that
+ * one) never returns null for old videos: a competitor outlier that's
+ * months old is exactly the case this feature needs to label clearly
+ * ("video: 8mo ago"), not hide.
+ */
+function fmtVideoAge(publishedAt: number | null): string | null {
+  if (!publishedAt) return null;
+  const sec = Math.floor(Date.now() / 1000) - publishedAt;
+  if (sec < 0) return null;
+  if (sec < 60) return "just now";
+  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+  const days = Math.floor(sec / 86400);
+  if (days < 7) return `${days}d ago`;
+  if (days < 30) return `${Math.floor(days / 7)}w ago`;
+  if (days < 365) return `${Math.floor(days / 30)}mo ago`;
+  return `${Math.floor(days / 365)}y ago`;
+}
+
+/** True once a video is old enough that the outlier is historical
+ * reference material rather than a current spike (see OutlierRow). */
+function isProvenHit(publishedAt: number | null): boolean {
+  if (!publishedAt) return false;
+  const days = (Date.now() / 1000 - publishedAt) / 86400;
+  return days > PROVEN_HIT_DAYS;
 }
 
 /** What "→ Ideas" needs to build the /api/ideas POST body. Kept generic
@@ -184,6 +218,26 @@ export function SignalsTab() {
  * ============================================================ */
 
 function OutliersSection({ outliers }: { outliers: FreshOutlier[] }) {
+  // Local copy so a dismissed alert can be spliced out immediately
+  // (optimistic UI) without waiting on a full /api/signals refetch.
+  // Re-synced from props whenever the parent reloads (e.g. Refresh
+  // button, or the initial load resolving).
+  const [rows, setRows] = useState(outliers);
+  useEffect(() => setRows(outliers), [outliers]);
+
+  const removeRow = useCallback((id: number) => {
+    setRows((prev) => prev.filter((r) => r.id !== id));
+  }, []);
+
+  const restoreRow = useCallback((row: FreshOutlier) => {
+    // Put it back in roughly the same place rather than always at the
+    // end — cheap approximation: re-sort by the same "fresh first, then
+    // detected_at desc" key the API already sorts by isn't worth
+    // re-deriving here, so just re-insert and let the next Refresh
+    // reconcile exact ordering.
+    setRows((prev) => [...prev, row]);
+  }, []);
+
   return (
     <Card>
       <CardHeader>
@@ -191,19 +245,24 @@ function OutliersSection({ outliers }: { outliers: FreshOutlier[] }) {
           <Flame className="h-4 w-4 text-orange-500" />
           Competitor outliers
           <span className="ml-auto text-xs font-normal text-muted-foreground">
-            {outliers.length}
+            {rows.length}
           </span>
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-1 pt-0">
-        {outliers.length === 0 ? (
+        {rows.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">
             No competitor outliers detected yet. Add competitors and sync them to
             start catching viral hits.
           </p>
         ) : (
-          outliers.map((o) => (
-            <OutlierRow key={o.id} outlier={o} />
+          rows.map((o) => (
+            <OutlierRow
+              key={o.id}
+              outlier={o}
+              onDismissed={() => removeRow(o.id)}
+              onDismissFailed={() => restoreRow(o)}
+            />
           ))
         )}
       </CardContent>
@@ -211,7 +270,17 @@ function OutliersSection({ outliers }: { outliers: FreshOutlier[] }) {
   );
 }
 
-function OutlierRow({ outlier: o }: { outlier: FreshOutlier }) {
+function OutlierRow({
+  outlier: o,
+  onDismissed,
+  onDismissFailed,
+}: {
+  outlier: FreshOutlier;
+  onDismissed: () => void;
+  onDismissFailed: () => void;
+}) {
+  const videoAge = fmtVideoAge(o.publishedAt);
+  const provenHit = isProvenHit(o.publishedAt);
   const draft: IdeaDraft = {
     title: o.title ?? "Untitled competitor video",
     notes: `Competitor outlier${o.competitor ? ` from ${o.competitor}` : ""} · ${fmtCompact(
@@ -248,6 +317,13 @@ function OutlierRow({ outlier: o }: { outlier: FreshOutlier }) {
         kind: o.kind,
         ageHours: o.ageHours,
       }}
+      endSlot={
+        <DismissAlertButton
+          alertId={o.id}
+          onDismissed={onDismissed}
+          onDismissFailed={onDismissFailed}
+        />
+      }
     >
       <div className="flex min-w-0 flex-1 items-start gap-2">
         {o.unread && (
@@ -272,7 +348,21 @@ function OutlierRow({ outlier: o }: { outlier: FreshOutlier }) {
               : o.multiplier != null
                 ? ` · ${o.multiplier}× median`
                 : ""}
+            {/* Video's own publish date — distinct from the "in Xh"
+                above (which is age-since-publish for the fresh detector
+                specifically). Omitted entirely when unknown, e.g. an
+                alert recorded before this field existed and not yet
+                backfilled. */}
+            {videoAge && ` · video: ${videoAge}`}
           </p>
+          {provenHit && (
+            <span
+              className="mt-1 inline-block rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+              title={`Published over ${PROVEN_HIT_DAYS} days ago — historical reference, not a current spike`}
+            >
+              proven hit
+            </span>
+          )}
         </div>
       </div>
     </SignalRow>
@@ -453,11 +543,17 @@ function SignalRow({
   generateType,
   generateSignal,
   children,
+  endSlot,
 }: {
   draft: IdeaDraft;
   generateType: GenerateType;
   generateSignal: unknown;
   children: React.ReactNode;
+  /** Optional trailing control rendered after the action buttons (e.g.
+   * the outlier-only dismiss ✕). Kept generic/optional so Gap and
+   * Audience rows — which don't have a dismiss action — render
+   * identically to before. */
+  endSlot?: React.ReactNode;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [variantsState, setVariantsState] = useState<VariantsState>({ kind: "idle" });
@@ -501,6 +597,7 @@ function SignalRow({
             Generate title
           </Button>
           <AddToIdeasButton draft={draft} />
+          {endSlot}
         </div>
       </div>
 
@@ -660,6 +757,61 @@ function AddToIdeasButton({ draft }: { draft: IdeaDraft }) {
         )}
       </Button>
       {state === "error" && error && (
+        <span className="max-w-[160px] text-right text-[11px] text-destructive">
+          {error}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+ * Dismiss alert — outlier-only ✕, optimistically removes the row from
+ * the local list then deletes server-side; restores the row (and shows
+ * an inline error, matching AddToIdeasButton's style above) on failure.
+ * ============================================================ */
+
+function DismissAlertButton({
+  alertId,
+  onDismissed,
+  onDismissFailed,
+}: {
+  alertId: number;
+  onDismissed: () => void;
+  onDismissFailed: () => void;
+}) {
+  const [error, setError] = useState<string | null>(null);
+
+  const dismiss = useCallback(async () => {
+    setError(null);
+    // Optimistic: remove immediately, before the request even resolves.
+    onDismissed();
+    try {
+      const r = await fetch(`/api/competitors/alerts/${alertId}`, {
+        method: "DELETE",
+      });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        throw new Error(d.error ?? `Failed (HTTP ${r.status})`);
+      }
+    } catch (e) {
+      onDismissFailed();
+      setError(e instanceof Error ? e.message : "Failed to dismiss");
+    }
+  }, [alertId, onDismissed, onDismissFailed]);
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <button
+        type="button"
+        onClick={dismiss}
+        className="rounded-md p-1 text-muted-foreground/60 hover:bg-accent hover:text-foreground"
+        aria-label="Dismiss alert"
+        title="Dismiss alert"
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+      {error && (
         <span className="max-w-[160px] text-right text-[11px] text-destructive">
           {error}
         </span>

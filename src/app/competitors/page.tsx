@@ -46,6 +46,12 @@ type Alert = {
   read_at: number | null;
   competitor_title: string | null;
   competitor_handle: string | null;
+  // The video's own publish date (unix seconds) — GET /api/competitors/alerts
+  // is a verbatim `{ alerts }` pass-through of listCompetitorAlerts, which
+  // does `SELECT a.*` against competitor_alerts, so this field rides along
+  // automatically now that the column exists (see src/lib/db.ts). NULL for
+  // alerts recorded before the migration ran and not yet backfilled.
+  published_at: number | null;
 };
 
 type Gap = {
@@ -249,6 +255,38 @@ export default function CompetitorsPage() {
     await refresh();
   };
 
+  const dismissAlert = async (id: number) => {
+    // Optimistic remove — splice it out of local state immediately and
+    // put it back (plus surface the error) if the DELETE fails.
+    const removed = alerts.find((a) => a.id === id);
+    setAlerts((prev) => prev.filter((a) => a.id !== id));
+    try {
+      const r = await fetch(`/api/competitors/alerts/${id}`, { method: "DELETE" });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        throw new Error(d.error ?? `HTTP ${r.status}`);
+      }
+      await refresh();
+    } catch (e) {
+      if (removed) setAlerts((prev) => [...prev, removed]);
+      setError(e instanceof Error ? e.message : "Failed to dismiss alert");
+    }
+  };
+
+  const clearReadAlerts = async () => {
+    try {
+      const r = await fetch("/api/competitors/alerts/clear-read", { method: "POST" });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        throw new Error(d.error ?? `HTTP ${r.status}`);
+      }
+      await refreshAlerts();
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to clear read alerts");
+    }
+  };
+
   const totalSubs = useMemo(
     () => competitors.reduce((acc, c) => acc + (c.subscriber_count ?? 0), 0),
     [competitors]
@@ -264,6 +302,13 @@ export default function CompetitorsPage() {
     );
     return max || null;
   }, [competitors]);
+
+  // Count of currently-loaded alerts that are read — drives the "Clear
+  // read (N)" button's label and its hidden-when-zero visibility.
+  const readCount = useMemo(
+    () => alerts.filter((a) => a.read_at != null).length,
+    [alerts]
+  );
 
   if (loading) {
     return (
@@ -546,6 +591,18 @@ export default function CompetitorsPage() {
                 </div>
               </div>
             </div>
+            {readCount > 0 && (
+              <div className="mb-3 flex justify-end">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={clearReadAlerts}
+                  className="gap-1.5 text-xs text-muted-foreground hover:text-foreground"
+                >
+                  Clear read ({readCount})
+                </Button>
+              </div>
+            )}
             {alerts.length === 0 ? (
               <div className="py-12 text-center text-sm text-muted-foreground">
                 No viral alerts yet. They appear automatically when a tracked
@@ -600,19 +657,40 @@ export default function CompetitorsPage() {
                             </span>
                           )}
                           <span>· {fmtRelative(a.detected_at)}</span>
+                          {/* Video's own publish date, distinct from the
+                              detection time above — without this, a
+                              competitor's first sync backfills months-old
+                              videos as alerts with no way to tell them
+                              apart from a fresh spike. Omitted when
+                              unknown (pre-migration row not yet
+                              backfilled). */}
+                          {a.published_at != null && (
+                            <span>· video {fmtRelative(a.published_at)}</span>
+                          )}
                         </div>
                       </div>
-                      {!a.read_at && (
+                      <div className="flex shrink-0 items-center gap-1">
+                        {!a.read_at && (
+                          <button
+                            type="button"
+                            onClick={() => markAlertRead(a.id)}
+                            className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                            aria-label="Mark read"
+                            title="Mark read"
+                          >
+                            <Check className="h-3.5 w-3.5" />
+                          </button>
+                        )}
                         <button
                           type="button"
-                          onClick={() => markAlertRead(a.id)}
-                          className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                          aria-label="Mark read"
-                          title="Mark read"
+                          onClick={() => dismissAlert(a.id)}
+                          className="rounded-md p-1 text-muted-foreground/60 hover:bg-accent hover:text-foreground"
+                          aria-label="Dismiss alert"
+                          title="Dismiss alert"
                         >
-                          <Check className="h-3.5 w-3.5" />
+                          <X className="h-3.5 w-3.5" />
                         </button>
-                      )}
+                      </div>
                     </li>
                   );
                 })}

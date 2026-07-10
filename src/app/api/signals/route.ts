@@ -49,24 +49,48 @@ export type FreshOutlier = {
   kind: string;
   ageHours: number | null;
   detectedAt: number;
+  publishedAt: number | null;
   unread: boolean;
 };
 
 /**
  * "fresh" kind alerts (age-based, brand new detector) OR unread legacy
  * outliers (kind is NULL, detected via the original median-multiplier
- * check) — newest first, capped at 25. We pull a generous window from
+ * check) — capped at 25. We pull a generous window from
  * listCompetitorAlerts (all alerts, not just unread) so read 'fresh'
  * alerts still surface — a fresh outlier is worth acting on whether or
  * not the user has dismissed its notification badge — then apply the
  * fresh-OR-unread-legacy filter ourselves since listCompetitorAlerts has
  * no native `kind` filter.
+ *
+ * Ordering: "fresh" kind entries first (these are active spikes — the
+ * whole point is reacting NOW — newest-detected first among them), then
+ * every other row (mostly a competitor's backfilled/legacy history)
+ * ordered by the video's own publish date, newest first, with rows
+ * whose publish date is unknown (pre-migration, not yet backfilled)
+ * sorted after everything that has one — falling back to detected_at
+ * for those. This is what actually fixes the "unsorted wall of history"
+ * complaint: without it, a first-time competitor sync backfills months
+ * of alerts in whatever order SQLite handed them back.
  */
 function getFreshOutliers(): FreshOutlier[] {
   const alerts = listCompetitorAlerts({ limit: 100 });
   return alerts
     .filter((a) => a.kind === "fresh" || (a.kind == null && a.read_at == null))
-    .sort((a, b) => b.detected_at - a.detected_at)
+    .sort((a, b) => {
+      const aFresh = a.kind === "fresh";
+      const bFresh = b.kind === "fresh";
+      if (aFresh !== bFresh) return aFresh ? -1 : 1;
+      if (aFresh && bFresh) return b.detected_at - a.detected_at;
+      // Non-fresh (legacy median-outlier) rows: newest video first, NULLS
+      // LAST, falling back to detected_at when both sides are NULL.
+      if (a.published_at != null && b.published_at != null) {
+        return b.published_at - a.published_at;
+      }
+      if (a.published_at != null) return -1;
+      if (b.published_at != null) return 1;
+      return b.detected_at - a.detected_at;
+    })
     .slice(0, 25)
     .map((a) => ({
       id: a.id,
@@ -78,6 +102,7 @@ function getFreshOutliers(): FreshOutlier[] {
       kind: a.kind ?? "median_outlier",
       ageHours: a.age_hours,
       detectedAt: a.detected_at,
+      publishedAt: a.published_at ?? null,
       unread: a.read_at == null,
     }));
 }

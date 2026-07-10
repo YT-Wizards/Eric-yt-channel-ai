@@ -3250,6 +3250,13 @@ db.exec(`
   const newCompAlertColumns: { name: string; type: string }[] = [
     { name: "kind", type: "TEXT" },
     { name: "age_hours", type: "REAL" },
+    // The video's own publish date (unix seconds), separate from
+    // `detected_at` (when OUR sync noticed it). Without this, a
+    // competitor's first-ever sync backfills months of history as
+    // alerts with no way for the user to tell "brand new spike" from
+    // "6-month-old video that happened to clear the median" — see
+    // backfill just below for existing rows.
+    { name: "published_at", type: "INTEGER" },
   ];
   for (const col of newCompAlertColumns) {
     if (compAlertCols.includes(col.name)) continue;
@@ -3260,6 +3267,27 @@ db.exec(`
       console.warn(`[db] add competitor_alerts.${col.name} failed (ignored):`, err);
     }
   }
+}
+
+// One-shot idempotent backfill for `published_at` on existing alert rows
+// (new rows get it written directly by recordCompetitorAlert). Cheap
+// correlated UPDATE — only rows still NULL are touched, so on every boot
+// after the first this is a no-op scan. competitor_videos is keyed by
+// (competitor_id, video_id), the same pair identifying the alert, so the
+// match is exact.
+try {
+  db.exec(`
+    UPDATE competitor_alerts
+    SET published_at = (
+      SELECT cv.published_at FROM competitor_videos cv
+      WHERE cv.competitor_id = competitor_alerts.competitor_id
+        AND cv.video_id = competitor_alerts.video_id
+    )
+    WHERE published_at IS NULL;
+  `);
+} catch (err) {
+  // eslint-disable-next-line no-console
+  console.warn("[db] competitor_alerts.published_at backfill failed (ignored):", err);
 }
 
 export type Competitor = {
@@ -3304,6 +3332,12 @@ export type CompetitorAlert = {
   // Video age in hours at detection time — only populated for
   // kind='fresh' alerts.
   age_hours: number | null;
+  // The video's own publish date (unix seconds) — NOT when we detected
+  // the alert (that's detected_at). Lets the UI show "video: 3d ago"
+  // instead of implying every alert is a fresh spike. NULL when the
+  // video's publish date wasn't known at detection time and hasn't been
+  // backfilled yet.
+  published_at: number | null;
 };
 
 /**
@@ -3693,17 +3727,22 @@ export function recordCompetitorAlert(a: {
   // working unchanged; only the new "fresh outlier" detector passes these.
   kind?: string | null;
   age_hours?: number | null;
+  // The video's own publish date (unix seconds), null when unknown at
+  // detection time. Optional for the same back-compat reason as kind/
+  // age_hours above.
+  published_at?: number | null;
 }): void {
   db.prepare(
     `INSERT INTO competitor_alerts
-       (competitor_id, video_id, title, thumbnail_url, views, channel_median_views, multiplier, kind, age_hours)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (competitor_id, video_id, title, thumbnail_url, views, channel_median_views, multiplier, kind, age_hours, published_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(competitor_id, video_id) DO UPDATE SET
        views = excluded.views,
        multiplier = excluded.multiplier,
        channel_median_views = excluded.channel_median_views,
        kind = excluded.kind,
-       age_hours = excluded.age_hours`
+       age_hours = excluded.age_hours,
+       published_at = excluded.published_at`
   ).run(
     a.competitor_id,
     a.video_id,
@@ -3713,7 +3752,8 @@ export function recordCompetitorAlert(a: {
     a.channel_median_views ?? null,
     a.multiplier ?? null,
     a.kind ?? null,
-    a.age_hours ?? null
+    a.age_hours ?? null,
+    a.published_at ?? null
   );
 }
 
@@ -3751,6 +3791,48 @@ export function markCompetitorAlertRead(id: number): void {
   db.prepare(
     `UPDATE competitor_alerts SET read_at = strftime('%s','now') WHERE id = ?`
   ).run(id);
+}
+
+/** Dismiss a single alert permanently (not just mark-read). Returns
+ * whether a row actually existed to delete, so the route can 404 on a
+ * stale/already-removed id instead of silently no-oping. */
+export function deleteCompetitorAlert(id: number): boolean {
+  const result = db
+    .prepare(`DELETE FROM competitor_alerts WHERE id = ?`)
+    .run(id);
+  return result.changes > 0;
+}
+
+/** Bulk "clear read" action for the Alerts tab header — removes every
+ * already-read alert in one go so the list doesn't accumulate forever.
+ * Unread alerts are untouched; a user still needs to see those at least
+ * once before they can be cleared this way. Returns the number removed. */
+export function clearReadCompetitorAlerts(): number {
+  const result = db
+    .prepare(`DELETE FROM competitor_alerts WHERE read_at IS NOT NULL`)
+    .run();
+  return result.changes;
+}
+
+/**
+ * Auto-purge read alerts older than `days` (by the video's detection
+ * time, not read time) so the competitor_alerts table stays finite even
+ * for a user who never manually clears read alerts. Unread alerts are
+ * NEVER touched here regardless of age — the whole point of an alert is
+ * that the user gets to see it at least once; only alerts that have
+ * already been read AND aged past the window are fair game. Called once
+ * per sync run (see syncCompetitor in competitor-sync.ts) rather than on
+ * a timer, so it piggybacks on activity the user already triggered
+ * instead of needing its own scheduler. Returns the number removed.
+ */
+export function purgeStaleReadCompetitorAlerts(days = 90): number {
+  const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+  const result = db
+    .prepare(
+      `DELETE FROM competitor_alerts WHERE read_at IS NOT NULL AND detected_at < ?`
+    )
+    .run(cutoff);
+  return result.changes;
 }
 
 /** Used by the competitors GET route / sidebar badge. Same per-channel
@@ -4522,6 +4604,14 @@ export function hookLibraryEntryForComment(
  * user-assigned from the UI — used to group videos for the category
  * breakdown widget. Both nullable: most existing videos won't have
  * either populated until a backfill job runs.
+ *
+ * `thumbnail_text` has THREE distinct states, not two:
+ *   - NULL       → never OCR'd. Still a backfill candidate.
+ *   - ''         → OCR ran and found no overlaid text on the thumbnail.
+ *                  This IS a completed result, not a pending one — do
+ *                  NOT re-OCR (and re-bill) these. See
+ *                  listVideosMissingThumbnailText below.
+ *   - non-empty  → OCR ran and found text; the cached copy itself.
  * ------------------------------------------------------------------ */
 {
   const videoCols = (
@@ -4567,6 +4657,13 @@ export function setVideoCategory(
  * cached yet but a thumbnail URL exists to OCR from. Powers the backfill
  * job's work queue. Newest videos first so freshly published content
  * gets covered before the long tail.
+ *
+ * IS NULL only, deliberately not `OR thumbnail_text = ''` — an empty
+ * string means OCR already ran and found no overlaid text, which is a
+ * completed result, not a pending one. Treating '' as "still missing"
+ * used to make every textless thumbnail get re-OCR'd (and re-billed)
+ * on every batch run forever, since the result could never satisfy its
+ * own "missing" check.
  */
 export function listVideosMissingThumbnailText(
   limit = 200
@@ -4578,7 +4675,7 @@ export function listVideosMissingThumbnailText(
       `SELECT id, title, thumbnail_url
        FROM videos
        WHERE channel_id = ?
-         AND (thumbnail_text IS NULL OR thumbnail_text = '')
+         AND thumbnail_text IS NULL
          AND thumbnail_url IS NOT NULL
        ORDER BY published_at DESC
        LIMIT ?`

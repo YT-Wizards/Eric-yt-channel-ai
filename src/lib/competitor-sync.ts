@@ -4,6 +4,7 @@ import {
   competitorMedianViews,
   getCompetitor,
   getIntegration,
+  purgeStaleReadCompetitorAlerts,
   recordCompetitorAlert,
   updateCompetitorAfterSync,
   upsertCompetitorComments,
@@ -143,6 +144,9 @@ function isQuotaExceeded(err: unknown): boolean {
  * ============================================================ */
 
 export async function syncCompetitor(competitorId: number): Promise<SyncResult> {
+  // Piggyback the stale-alert purge on sync activity rather than a timer.
+  purgeStaleReadCompetitorAlerts();
+
   const competitor = getCompetitor(competitorId);
   if (!competitor) {
     throw new CompetitorSyncError(`Competitor ${competitorId} not found`);
@@ -307,7 +311,12 @@ async function syncViaYouTubeApi(
     for (const v of videos) {
       if (!v.views) continue;
       const multiplier = v.views / median;
-      const isMedianOutlier = multiplier >= OUTLIER_MULTIPLIER;
+      // Noise floor for the legacy median-outlier detector only: a tiny
+      // channel's median can be a handful of views, so "2x median" can
+      // trip on e.g. 40 views vs a 20-view median — real to the channel,
+      // meaningless to the user browsing alerts. The "fresh" detector
+      // below already has its own floor (views >= max(1000, 0.1*median)).
+      const isMedianOutlier = multiplier >= OUTLIER_MULTIPLIER && v.views >= 1000;
       if (isMedianOutlier) {
         recordCompetitorAlert({
           competitor_id: competitor.id,
@@ -317,6 +326,7 @@ async function syncViaYouTubeApi(
           views: v.views,
           channel_median_views: median,
           multiplier: Math.round(multiplier * 10) / 10,
+          published_at: v.publishedAt ?? null,
         });
         newAlerts++;
       }
@@ -365,6 +375,7 @@ async function syncViaYouTubeApi(
               multiplier: Math.round((vph / expectedPaceViewsPerHour) * 10) / 10,
               kind: "fresh",
               age_hours: Math.round(ageHours * 10) / 10,
+              published_at: v.publishedAt ?? null,
             });
             newAlerts++;
           }
@@ -467,7 +478,12 @@ async function syncViaApify(
       const vid = extractVideoId(it.url, it.id);
       if (!vid || !it.title || !it.viewCount) continue;
       const multiplier = it.viewCount / median;
-      const isMedianOutlier = multiplier >= OUTLIER_MULTIPLIER;
+      // Noise floor for the legacy median-outlier detector only — see
+      // matching comment on the YouTube Data API path above. The
+      // "fresh" detector below already has its own floor.
+      const isMedianOutlier = multiplier >= OUTLIER_MULTIPLIER && it.viewCount >= 1000;
+      // Parsed once here and reused by the "fresh outlier" check below.
+      const publishedAt = parseDate(it.date);
       if (isMedianOutlier) {
         recordCompetitorAlert({
           competitor_id: competitor.id,
@@ -477,6 +493,7 @@ async function syncViaApify(
           views: it.viewCount,
           channel_median_views: median,
           multiplier: Math.round(multiplier * 10) / 10,
+          published_at: publishedAt,
         });
         newAlerts++;
       }
@@ -505,7 +522,6 @@ async function syncViaApify(
        *   would just overwrite the median alert row on the
        *   (competitor_id, video_id) upsert.
        * ------------------------------------------------------------ */
-      const publishedAt = parseDate(it.date);
       if (!isMedianOutlier && publishedAt) {
         const ageHours = (Date.now() / 1000 - publishedAt) / 3600;
         if (ageHours >= 0.5 && ageHours <= 72) {
@@ -526,6 +542,7 @@ async function syncViaApify(
               multiplier: Math.round((vph / expectedPaceViewsPerHour) * 10) / 10,
               kind: "fresh",
               age_hours: Math.round(ageHours * 10) / 10,
+              published_at: publishedAt,
             });
             newAlerts++;
           }
