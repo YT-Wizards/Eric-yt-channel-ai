@@ -64,6 +64,43 @@ type Gap = {
 
 type Tab = "overview" | "gaps" | "alerts";
 
+/**
+ * Server-side job state for the "Sync All" batch — mirrors the shape
+ * POSTed/GETed from /api/competitors/sync-all (same settings-backed job
+ * pattern as thumbnails-ocr's OcrJob). This is now the SINGLE source of
+ * truth for "is a bulk sync running" — the old approach polled
+ * /api/competitors and compared every competitor's last_sync_at against
+ * the moment "Sync All" was clicked, which had two problems: (1) it had
+ * no way to tell "still working" apart from "the process that was doing
+ * the work died/restarted", so a mid-run restart left the UI spinning
+ * forever with no escape but a manual reload, and (2) it gave zero
+ * progress feedback — just a spinner for up to 3 minutes. Polling this
+ * job instead survives navigation (the server keeps working regardless
+ * of who's watching) AND survives a fresh page load / process restart
+ * mid-run (GET just reflects whatever's in the settings table).
+ */
+type SyncAllJob = {
+  running: boolean;
+  done: number;
+  failed: number;
+  total: number;
+  current: string | null;
+  startedAt: number;
+  finishedAt?: number;
+  lastError?: string | null;
+};
+
+const SYNC_JOB_POLL_MS = 3000;
+// Mirrors the server's STALE_JOB_MS in sync-all/route.ts — a job still
+// marked running past this age is treated as dead (process restarted
+// without ever writing running:false) rather than trusted forever.
+const SYNC_JOB_STALE_MS = 2 * 60 * 60 * 1000;
+
+function truncateCurrent(title: string | null): string {
+  if (!title) return "";
+  return title.length > 18 ? `${title.slice(0, 18)}…` : title;
+}
+
 function fmtCount(n: number | null | undefined): string {
   if (!n && n !== 0) return "—";
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, "") + "M";
@@ -90,7 +127,7 @@ export default function CompetitorsPage() {
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState(false);
   const [identifier, setIdentifier] = useState("");
-  const [syncingAll, setSyncingAll] = useState(false);
+  const [syncJob, setSyncJob] = useState<SyncAllJob | null>(null);
   const [syncingIds, setSyncingIds] = useState<Set<number>>(new Set());
   const [error, setError] = useState<string | null>(null);
 
@@ -129,11 +166,67 @@ export default function CompetitorsPage() {
     }
   }, []);
 
+  const refreshSyncJob = useCallback(async () => {
+    try {
+      const r = await fetch("/api/competitors/sync-all", { cache: "no-store" });
+      const d = (await r.json()) as { job?: SyncAllJob | null };
+      setSyncJob(d.job ?? null);
+    } catch {
+      /* keep current */
+    }
+  }, []);
+
   useEffect(() => {
     refresh();
     refreshAlerts();
     refreshGaps();
-  }, [refresh, refreshAlerts, refreshGaps]);
+    // On mount, also check whether a bulk sync is already running
+    // server-side — e.g. the user navigated away mid-sync and came back,
+    // or reloaded the page. If so, the poll effect below (keyed on
+    // syncJob?.running) picks it up and resumes showing progress; the
+    // server never stopped working regardless of whether anyone was
+    // watching.
+    refreshSyncJob();
+  }, [refresh, refreshAlerts, refreshGaps, refreshSyncJob]);
+
+  // While a bulk sync job is running, poll its GET every few seconds.
+  // The server keeps working regardless of whether we're polling —
+  // that's the point — so this effect's cleanup just stops the
+  // interval, it doesn't touch the job. A job stuck "running" past
+  // SYNC_JOB_STALE_MS is treated as dead (process restarted mid-run)
+  // so the UI doesn't spin forever waiting on a poll that will never
+  // flip to finished.
+  useEffect(() => {
+    if (!syncJob?.running) return;
+    if (Date.now() - syncJob.startedAt >= SYNC_JOB_STALE_MS) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const r = await fetch("/api/competitors/sync-all", { cache: "no-store" });
+        const d = (await r.json()) as { job?: SyncAllJob | null };
+        if (cancelled) return;
+        setSyncJob(d.job ?? null);
+        if (d.job && !d.job.running) {
+          // Finished (or crashed) — refetch competitors/alerts/gaps so
+          // the page reflects everything the background loop did, and
+          // surface any error via the page's existing error banner.
+          await refresh();
+          await refreshAlerts();
+          await refreshGaps();
+          if (d.job.lastError) {
+            setError(`Sync All finished with errors: ${d.job.lastError}`);
+          }
+        }
+      } catch {
+        /* transient */
+      }
+    };
+    const id = window.setInterval(tick, SYNC_JOB_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [syncJob?.running, syncJob?.startedAt, refresh, refreshAlerts, refreshGaps]);
 
   const addCompetitor = async () => {
     if (!identifier.trim()) return;
@@ -194,46 +287,39 @@ export default function CompetitorsPage() {
   };
 
   const syncAll = async () => {
-    setSyncingAll(true);
     setError(null);
-    const startedAt = Math.floor(Date.now() / 1000);
     try {
       const r = await fetch("/api/competitors/sync-all", { method: "POST" });
-      if (!r.ok) {
-        const d = (await r.json().catch(() => ({}))) as { error?: string };
-        throw new Error(d.error ?? `HTTP ${r.status}`);
+      const d = (await r.json().catch(() => ({}))) as {
+        error?: string;
+        started?: boolean;
+        total?: number;
+      };
+      if (r.status === 409) {
+        // Already running server-side (e.g. kicked off from another tab,
+        // or this page just hasn't caught up yet) — just start polling.
+        await refreshSyncJob();
+        return;
       }
-      // The endpoint is fire-and-forget now — it returns instantly and
-      // syncs competitors in the background. Poll the list every few
-      // seconds so cards refresh as each competitor finishes. Stop once
-      // every competitor's last_sync_at is newer than when we started,
-      // or after a hard 3-minute ceiling so the button can't spin
-      // forever if a competitor sync errors before stamping its time.
-      const deadline = Date.now() + 3 * 60 * 1000;
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        await new Promise((res) => setTimeout(res, 4000));
-        let list: { competitors: Competitor[]; unreadAlerts: number };
-        try {
-          const listRes = await fetch("/api/competitors", { cache: "no-store" });
-          list = (await listRes.json()) as typeof list;
-        } catch {
-          if (Date.now() > deadline) break;
-          continue;
-        }
-        setCompetitors(list.competitors);
-        setUnread(list.unreadAlerts);
-        refreshAlerts();
-        refreshGaps();
-        const allFresh =
-          list.competitors.length > 0 &&
-          list.competitors.every((c) => (c.last_sync_at ?? 0) >= startedAt);
-        if (allFresh || Date.now() > deadline) break;
+      if (!r.ok || !d.started) {
+        setError(d.error ?? `Sync All failed (HTTP ${r.status})`);
+        await refreshSyncJob();
+        return;
       }
+      // Optimistically reflect "running" immediately; the poll effect
+      // above (keyed on syncJob?.running) takes over from here and is
+      // the single source of truth for progress from this point on.
+      setSyncJob({
+        running: true,
+        done: 0,
+        failed: 0,
+        total: d.total ?? competitors.length,
+        current: null,
+        startedAt: Date.now(),
+      });
     } catch (e) {
       setError(e instanceof Error ? e.message : "sync failed");
-    } finally {
-      setSyncingAll(false);
+      await refreshSyncJob();
     }
   };
 
@@ -310,6 +396,22 @@ export default function CompetitorsPage() {
     [alerts]
   );
 
+  // Treat a job stuck "running" past the staleness window as not
+  // actually running — mirrors the server's own 409 staleness check, so
+  // the button never gets permanently wedged by a job whose process
+  // died without ever writing running:false.
+  const syncAllRunning =
+    !!syncJob?.running && Date.now() - syncJob.startedAt < SYNC_JOB_STALE_MS;
+  const syncAllLabel = syncAllRunning
+    ? `Syncing ${(syncJob!.done ?? 0) + (syncJob!.failed ?? 0)}/${syncJob!.total ?? 0}${
+        // truncateCurrent already appends its own "…" when it truncates
+        // a long title, so don't double it up here — only add a bare
+        // "…" when there's no current title to show (briefly true right
+        // after POST, and between competitors for an instant).
+        syncJob!.current ? ` — ${truncateCurrent(syncJob!.current)}` : "…"
+      }`
+    : "Sync All";
+
   if (loading) {
     return (
       <div className="mx-auto max-w-6xl">
@@ -339,15 +441,20 @@ export default function CompetitorsPage() {
             variant="outline"
             size="sm"
             onClick={syncAll}
-            disabled={syncingAll || competitors.length === 0}
+            disabled={syncAllRunning || competitors.length === 0}
             className="gap-1.5"
+            title={
+              syncAllRunning
+                ? "A bulk sync is running in the background — safe to navigate away, it keeps working."
+                : undefined
+            }
           >
-            {syncingAll ? (
+            {syncAllRunning ? (
               <Loader2 className="h-3.5 w-3.5 animate-spin" />
             ) : (
               <RefreshCw className="h-3.5 w-3.5" />
             )}
-            Sync All
+            {syncAllLabel}
           </Button>
         </div>
       </header>

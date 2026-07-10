@@ -2,6 +2,7 @@ import "server-only";
 import { apifyYouTubeScrape, type ApifyYouTubeVideo } from "./apify";
 import {
   competitorMedianViews,
+  db,
   getCompetitor,
   getIntegration,
   purgeStaleReadCompetitorAlerts,
@@ -139,6 +140,32 @@ function isQuotaExceeded(err: unknown): boolean {
   return /quota/i.test(err.message);
 }
 
+// Cached prepared statement — this runs once per video on every sync
+// (potentially dozens of times per competitor), so preparing it fresh
+// each call would be wasteful. Mirrors the db.prepare(...).get(...)
+// idiom used throughout db.ts (e.g. commentCount, unreadCompetitorAlertCount);
+// added here rather than as a new db.ts export since it's a one-off,
+// sync-internal existence check with no other caller.
+const hasCachedCommentsStmt = db.prepare(
+  `SELECT 1 FROM competitor_comments WHERE competitor_id = ? AND video_id = ? LIMIT 1`
+);
+
+/**
+ * True when `video_id` already has at least one cached comment row for
+ * this competitor. Used to skip re-fetching comments on every re-sync —
+ * a competitor sync used to spend ~1 YT Data API call per video (up to
+ * VIDEOS_PER_SYNC = 50) refetching the same top-relevance comment set
+ * every single time, which is most of why a "healthy" sync took 1-3
+ * minutes per competitor. Top-comment sets on an already-seen video
+ * rarely shift enough between syncs to justify paying that cost again;
+ * the video's view/like counts (which DO change) are still refreshed
+ * every sync via upsertCompetitorVideo above, only the comment re-fetch
+ * is skipped.
+ */
+function hasCachedComments(competitorId: number, videoId: string): boolean {
+  return hasCachedCommentsStmt.get(competitorId, videoId) !== undefined;
+}
+
 /* ============================================================
  * Public entrypoint — picks the best backend and falls back on quota.
  * ============================================================ */
@@ -257,11 +284,20 @@ async function syncViaYouTubeApi(
 
   // 5. Top comments per video (1 unit per video — biggest quota chunk).
   //    If the quota runs out mid-loop we bail out gracefully without
-  //    failing the whole sync.
+  //    failing the whole sync. Videos already carrying cached comments
+  //    from a previous sync are skipped entirely (see hasCachedComments)
+  //    — this is the single biggest reason re-syncing a competitor used
+  //    to take 1-3 minutes: 50 videos × 1 comment-thread call each, every
+  //    single time, even though the top comments rarely change.
   let commentsSaved = 0;
+  let commentsSkipped = 0;
   let quotaHitOnComments = false;
   for (const v of videos) {
     if (quotaHitOnComments) break;
+    if (hasCachedComments(competitor.id, v.id)) {
+      commentsSkipped++;
+      continue;
+    }
     try {
       const threads = await fetchCommentThreads(v.id, youtubeKey, {
         maxThreads: COMMENTS_PER_VIDEO,
@@ -390,6 +426,7 @@ async function syncViaYouTubeApi(
     videosInserted,
     transcriptsSaved,
     commentsSaved,
+    commentsSkipped,
     newAlerts,
     medianViews: median,
     durationMs: Date.now() - startedAt,
