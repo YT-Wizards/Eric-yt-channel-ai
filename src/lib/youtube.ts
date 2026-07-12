@@ -689,7 +689,15 @@ export async function nicheExplorer(
 export async function searchYouTube(
   query: string,
   apiKey: string,
-  opts: { maxResults?: number; type?: "video" | "channel" } = {}
+  opts: {
+    maxResults?: number;
+    type?: "video" | "channel";
+    /** ISO 8601 timestamp — only return items published after this moment.
+     * Niche Watch passes "7 days ago"; without it search defaults to
+     * all-time relevance and fresh-trend scans come back empty. */
+    publishedAfter?: string;
+    order?: "relevance" | "date" | "viewCount";
+  } = {}
 ): Promise<{ id: string; kind: string; title: string; channelTitle: string; publishedAt: string }[]> {
   const res = await call<{
     items: {
@@ -703,6 +711,8 @@ export async function searchYouTube(
       q: query,
       type: opts.type ?? "video",
       maxResults: opts.maxResults ?? 10,
+      ...(opts.publishedAfter ? { publishedAfter: opts.publishedAfter } : {}),
+      ...(opts.order ? { order: opts.order } : {}),
     },
     apiKey
   );

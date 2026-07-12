@@ -5100,3 +5100,231 @@ export function addYouTubeQuotaUnits(units: number): void {
 export function getYouTubeQuotaToday(): number {
   return Number(getSetting(youtubeQuotaKeyForToday()) ?? "0");
 }
+
+/* ------------------------------------------------------------------ *
+ * Niche Watch — "what's trending in my niche right now".
+ *
+ * Scanning the whole of YouTube for trending videos isn't possible
+ * through the public Data API — there's no "show me everything
+ * trending" endpoint, and chart=mostPopular is a single global/regional
+ * list, not per-topic. Instead the user defines a handful of watch
+ * niches — free-form search phrases, per channel, universal, never a
+ * hardcoded topic list — and a scan job (see src/lib/niche-watch.ts and
+ * src/app/api/niche-watch/scan/route.ts) searches each one for videos
+ * published in the last 7 days, ranks them by views-per-hour, and stores
+ * hits here for the Signals tab to render.
+ *
+ * `niche_hits` is a "trending now" table, not a permanent archive — a
+ * video still inside the 7-day search window gets its views/vph
+ * refreshed on every scan (ON CONFLICT UPDATE) while first_seen_at stays
+ * put, and `pruneNicheHits()` deletes hits whose video has aged out of
+ * that window so the list doesn't accumulate stale "was trending 3
+ * weeks ago" rows forever.
+ * ------------------------------------------------------------------ */
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS watch_niches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL,
+    query TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    UNIQUE(channel_id, query)
+  );
+  CREATE INDEX IF NOT EXISTS idx_watch_niches_channel ON watch_niches(channel_id);
+
+  CREATE TABLE IF NOT EXISTS niche_hits (
+    niche_id INTEGER NOT NULL,
+    video_id TEXT NOT NULL,
+    title TEXT,
+    channel_title TEXT,
+    channel_yt_id TEXT,
+    views INTEGER,
+    published_at INTEGER,
+    vph REAL,
+    first_seen_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    last_scan_at INTEGER,
+    PRIMARY KEY (niche_id, video_id),
+    FOREIGN KEY (niche_id) REFERENCES watch_niches(id) ON DELETE CASCADE
+  );
+  CREATE INDEX IF NOT EXISTS idx_niche_hits_vph ON niche_hits(niche_id, vph DESC);
+`);
+
+export type WatchNiche = {
+  id: number;
+  channel_id: string;
+  query: string;
+  created_at: number;
+};
+
+/** Row shape returned by listWatchNiches — channel_id is dropped since
+ * every row is already scoped to the active channel. */
+export type WatchNicheSummary = {
+  id: number;
+  query: string;
+  created_at: number;
+  hitCount: number;
+};
+
+export type NicheHit = {
+  nicheId: number;
+  nicheQuery: string;
+  videoId: string;
+  title: string | null;
+  channelTitle: string | null;
+  views: number | null;
+  publishedAt: number | null;
+  vph: number | null;
+  firstSeenAt: number;
+};
+
+const MAX_WATCH_NICHES_PER_CHANNEL = 6;
+const WATCH_NICHE_MIN_LEN = 2;
+const WATCH_NICHE_MAX_LEN = 60;
+
+/**
+ * Configured watch niches for the active channel, newest first, each
+ * annotated with how many hits it currently has (LEFT JOIN count so a
+ * brand-new niche with zero hits yet still shows up, with hitCount: 0).
+ */
+export function listWatchNiches(): WatchNicheSummary[] {
+  const activeId = requireActiveChannelId();
+  return db
+    .prepare(
+      `SELECT wn.id AS id,
+              wn.query AS query,
+              wn.created_at AS created_at,
+              COUNT(nh.video_id) AS hitCount
+       FROM watch_niches wn
+       LEFT JOIN niche_hits nh ON nh.niche_id = wn.id
+       WHERE wn.channel_id = ?
+       GROUP BY wn.id
+       ORDER BY wn.created_at DESC`
+    )
+    .all(activeId) as WatchNicheSummary[];
+}
+
+/**
+ * Add a watch niche for the active channel. Idempotent on
+ * (channel_id, query): re-adding an existing query just returns the
+ * existing row rather than erroring or double-counting against the
+ * per-channel cap.
+ */
+export function addWatchNiche(query: string): WatchNiche {
+  const activeId = requireActiveChannelId();
+  const trimmed = query.trim();
+  if (trimmed.length < WATCH_NICHE_MIN_LEN || trimmed.length > WATCH_NICHE_MAX_LEN) {
+    throw new Error(
+      `Watch niche query must be between ${WATCH_NICHE_MIN_LEN} and ${WATCH_NICHE_MAX_LEN} characters`
+    );
+  }
+
+  const existing = db
+    .prepare(`SELECT * FROM watch_niches WHERE channel_id = ? AND query = ?`)
+    .get(activeId, trimmed) as WatchNiche | undefined;
+  if (existing) return existing;
+
+  const { count } = db
+    .prepare(`SELECT COUNT(*) AS count FROM watch_niches WHERE channel_id = ?`)
+    .get(activeId) as { count: number };
+  if (count >= MAX_WATCH_NICHES_PER_CHANNEL) {
+    throw new Error(`Maximum ${MAX_WATCH_NICHES_PER_CHANNEL} watch niches per channel`);
+  }
+
+  db.prepare(
+    `INSERT OR IGNORE INTO watch_niches (channel_id, query) VALUES (?, ?)`
+  ).run(activeId, trimmed);
+
+  return db
+    .prepare(`SELECT * FROM watch_niches WHERE channel_id = ? AND query = ?`)
+    .get(activeId, trimmed) as WatchNiche;
+}
+
+/** Delete a watch niche (only if it belongs to the active channel) —
+ * cascades to its niche_hits rows via ON DELETE CASCADE. */
+export function deleteWatchNiche(id: number): boolean {
+  const activeId = requireActiveChannelId();
+  const info = db
+    .prepare(`DELETE FROM watch_niches WHERE id = ? AND channel_id = ?`)
+    .run(id, activeId);
+  return info.changes > 0;
+}
+
+/**
+ * Record (or refresh) a single trending hit for a niche. ON CONFLICT
+ * updates only the fields that legitimately change between scans
+ * (views, vph, title, last_scan_at); first_seen_at, channel_title,
+ * channel_yt_id and published_at stay as first recorded so the UI can
+ * show "first spotted 2 days ago" even as views keep climbing.
+ */
+export function upsertNicheHit(h: {
+  niche_id: number;
+  video_id: string;
+  title: string | null;
+  channel_title: string | null;
+  channel_yt_id: string | null;
+  views: number;
+  published_at: number;
+  vph: number;
+}): void {
+  db.prepare(
+    `INSERT INTO niche_hits
+       (niche_id, video_id, title, channel_title, channel_yt_id, views, published_at, vph, last_scan_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+     ON CONFLICT(niche_id, video_id) DO UPDATE SET
+       views = excluded.views,
+       vph = excluded.vph,
+       title = excluded.title,
+       last_scan_at = excluded.last_scan_at`
+  ).run(
+    h.niche_id,
+    h.video_id,
+    h.title,
+    h.channel_title,
+    h.channel_yt_id,
+    h.views,
+    h.published_at,
+    h.vph
+  );
+}
+
+/**
+ * Latest hits across every watch niche for the active channel, ranked
+ * by views-per-hour (the "hottest right now" ordering the Signals tab
+ * wants), capped at `limit`.
+ */
+export function listNicheHits(limit = 50): NicheHit[] {
+  const activeId = requireActiveChannelId();
+  return db
+    .prepare(
+      `SELECT nh.niche_id AS nicheId,
+              wn.query AS nicheQuery,
+              nh.video_id AS videoId,
+              nh.title AS title,
+              nh.channel_title AS channelTitle,
+              nh.views AS views,
+              nh.published_at AS publishedAt,
+              nh.vph AS vph,
+              nh.first_seen_at AS firstSeenAt
+       FROM niche_hits nh
+       JOIN watch_niches wn ON wn.id = nh.niche_id
+       WHERE wn.channel_id = ?
+       ORDER BY nh.vph DESC
+       LIMIT ?`
+    )
+    .all(activeId, limit) as NicheHit[];
+}
+
+/**
+ * Delete hits whose video has aged out of the "trending now" window
+ * (published more than `days` ago). Deliberately NOT scoped to the
+ * active channel — a scan triggered from channel A shouldn't be the
+ * only thing that ever cleans up channel B's stale hits, so every call
+ * prunes globally regardless of which channel's scan triggered it.
+ */
+export function pruneNicheHits(days = 14): number {
+  const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+  const info = db
+    .prepare(`DELETE FROM niche_hits WHERE published_at < ?`)
+    .run(cutoff);
+  return info.changes;
+}

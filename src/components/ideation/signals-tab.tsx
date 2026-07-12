@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import {
   AlertCircle,
@@ -12,18 +12,27 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import type { AudienceRequest, FreshOutlier } from "@/app/api/signals/route";
 
 /**
  * Signals tab of the Ideation hub — one actionable feed answering
- * "what should I make next, based on data". Three sections, all
- * sourced from /api/signals (itself scoped to the active channel):
+ * "what should I make next, based on data". Four sections: three are
+ * sourced from /api/signals (itself scoped to the active channel) —
  * competitor outliers worth reacting to, content gaps competitors
  * cover and this channel doesn't, and audience requests mined out of
- * comment analysis. Every row can either generate 3 grounded title
+ * comment analysis — plus Niche Watch, which fetches independently
+ * from /api/niche-watch (user-defined search phrases scanned for
+ * fresh, hot videos). Every row can either generate 3 grounded title
  * variants (via /api/signals/generate-title) or go straight to the
  * idea board (via /api/ideas).
  *
@@ -44,6 +53,48 @@ type SignalsResponse = {
   freshOutliers: FreshOutlier[];
   gaps: Gap[];
   audienceRequests: AudienceRequest[];
+};
+
+/** A configured watch niche for the active channel — mirrors
+ * WatchNicheSummary in src/lib/db.ts as returned by GET /api/niche-watch.
+ * Redefined locally (rather than imported) so this file never pulls in
+ * db.ts's "server-only" module graph — same reasoning as the job types
+ * below. */
+type WatchNiche = {
+  id: number;
+  query: string;
+  created_at: number;
+  hitCount: number;
+};
+
+/** A single ranked "trending in my niche right now" hit — mirrors
+ * NicheHit in src/lib/db.ts as returned by GET /api/niche-watch. */
+type NicheHit = {
+  nicheId: number;
+  nicheQuery: string;
+  videoId: string;
+  title: string | null;
+  channelTitle: string | null;
+  views: number | null;
+  publishedAt: number | null;
+  vph: number | null;
+  firstSeenAt: number;
+};
+
+/** Server-side job state for the niche-watch scan batch — mirrors the
+ * shape POSTed/GETed from /api/niche-watch/scan (same settings-backed
+ * job pattern as the OCR/categorize/sync-all jobs elsewhere in the app:
+ * the scan keeps running server-side regardless of who's watching, this
+ * type just describes what a poller reads back). */
+type NicheScanJob = {
+  running: boolean;
+  done: number;
+  total: number;
+  current: string | null;
+  found: number;
+  startedAt: number;
+  finishedAt?: number;
+  lastError?: string | null;
 };
 
 function fmtCompact(n: number | null | undefined): string {
@@ -96,8 +147,46 @@ function isProvenHit(publishedAt: number | null): boolean {
   return days > PROVEN_HIT_DAYS;
 }
 
+// Mirrors MAX_WATCH_NICHES_PER_CHANNEL in src/lib/db.ts — not exported
+// from there, so kept in sync here as a plain literal.
+const MAX_WATCH_NICHES = 6;
+
+// Poll cadence + staleness window for the niche-watch scan job — same
+// values/idiom as SYNC_JOB_POLL_MS / SYNC_JOB_STALE_MS in
+// src/app/competitors/page.tsx (which itself mirrors the server's own
+// STALE_JOB_MS in scan/route.ts).
+const SCAN_JOB_POLL_MS = 3000;
+const SCAN_JOB_STALE_MS = 2 * 60 * 60 * 1000;
+
+// "Fresh enough, no need to auto-scan again yet" window used by
+// NicheWatchSection's auto-freshness effect below.
+const AUTO_SCAN_FRESH_MS = 12 * 60 * 60 * 1000;
+
+/** Truncates a niche query for the "Scanning N/M — {current}…" label —
+ * same idiom as truncateCurrent in src/app/competitors/page.tsx. */
+function truncateNiche(query: string): string {
+  return query.length > 18 ? `${query.slice(0, 18)}…` : query;
+}
+
+/** Same rounding/formatting as fmtVph in
+ * src/components/ideation/videos-tab.tsx, redefined locally since that
+ * one isn't exported. */
+function fmtVph(n: number | null): string {
+  if (n === null) return "—";
+  return Math.round(n).toLocaleString();
+}
+
+/** Median of a numeric list — used by NicheWatchSection to flag hits
+ * whose vph is "exploding" (>= 3x the median of the hits shown). */
+function median(nums: number[]): number {
+  if (nums.length === 0) return 0;
+  const sorted = [...nums].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
 /** What "→ Ideas" needs to build the /api/ideas POST body. Kept generic
- * across all three signal kinds so one button component + one submit
+ * across every signal kind so one button component + one submit
  * function handles every row. */
 type IdeaDraft = {
   title: string;
@@ -206,10 +295,450 @@ export function SignalsTab() {
         </Button>
       </div>
 
+      <NicheWatchSection />
       <OutliersSection outliers={data?.freshOutliers ?? []} />
       <GapsSection gaps={data?.gaps ?? []} />
       <AudienceSection requests={data?.audienceRequests ?? []} />
     </div>
+  );
+}
+
+/* ============================================================
+ * Section 0 — Niche watch (broadest signal, placed above outliers).
+ * User-defined search phrases scanned for videos from the last 7 days,
+ * ranked by views-per-hour. Fetches independently of /api/signals (its
+ * own GET /api/niche-watch), so it has its own loading/error state
+ * rather than sharing SignalsTab's.
+ * ============================================================ */
+
+function NicheWatchSection() {
+  const [niches, setNiches] = useState<WatchNiche[]>([]);
+  const [hits, setHits] = useState<NicheHit[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const [query, setQuery] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [chipError, setChipError] = useState<string | null>(null);
+
+  const [job, setJob] = useState<NicheScanJob | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [scanFlash, setScanFlash] = useState<string | null>(null);
+
+  // Guards the auto-freshness effect further down so it fires at most
+  // once per mount, even though its own dependencies (job, hits) change
+  // as the scan it kicks off runs and updates state.
+  const autoScanFired = useRef(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      const r = await fetch("/api/niche-watch", { cache: "no-store" });
+      if (r.status === 400) {
+        // SignalsTab's own noActiveChannel screen already gates this
+        // whole section behind an active-channel check (it returns
+        // early, before any section — including this one — ever
+        // renders). This branch is just a defensive no-op for the rare
+        // race of the active channel changing after mount.
+        setNiches([]);
+        setHits([]);
+        return;
+      }
+      const d = (await r.json()) as {
+        niches?: WatchNiche[];
+        hits?: NicheHit[];
+        error?: string;
+      };
+      if (!r.ok) {
+        setLoadError(d.error ?? `Failed to load (HTTP ${r.status})`);
+        return;
+      }
+      setLoadError(null);
+      setNiches(d.niches ?? []);
+      setHits(d.hits ?? []);
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : "Failed to load");
+    }
+  }, []);
+
+  const refreshJob = useCallback(async () => {
+    try {
+      const r = await fetch("/api/niche-watch/scan", { cache: "no-store" });
+      const d = (await r.json()) as { job?: NicheScanJob | null };
+      setJob(d.job ?? null);
+    } catch {
+      /* keep current */
+    }
+  }, []);
+
+  // Mount-time: load niches/hits plus whatever scan job state already
+  // exists server-side — e.g. the user navigated away mid-scan and came
+  // back, or reloaded the page. If a job is running, the poll effect
+  // below (keyed on job?.running) resumes showing progress from here;
+  // the server never stopped working regardless of who was watching.
+  useEffect(() => {
+    (async () => {
+      setLoading(true);
+      await Promise.all([refresh(), refreshJob()]);
+      setLoading(false);
+    })();
+  }, [refresh, refreshJob]);
+
+  // While a scan is running, poll its GET every few seconds — same
+  // idiom as the SyncAllJob poller in src/app/competitors/page.tsx. A
+  // job stuck "running" past SCAN_JOB_STALE_MS is treated as dead
+  // (process restarted mid-run) so this never polls forever.
+  useEffect(() => {
+    if (!job?.running) return;
+    if (Date.now() - job.startedAt >= SCAN_JOB_STALE_MS) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const r = await fetch("/api/niche-watch/scan", { cache: "no-store" });
+        const d = (await r.json()) as { job?: NicheScanJob | null };
+        if (cancelled) return;
+        setJob(d.job ?? null);
+        if (d.job && !d.job.running) {
+          await refresh(); // pick up whatever hits the scan just found
+          setScanFlash(`found ${d.job.found}`);
+          if (d.job.lastError) setScanError(d.job.lastError);
+        }
+      } catch {
+        /* transient */
+      }
+    };
+    const id = window.setInterval(tick, SCAN_JOB_POLL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [job?.running, job?.startedAt, refresh]);
+
+  const runScan = useCallback(async () => {
+    setScanError(null);
+    setScanFlash(null);
+    try {
+      const r = await fetch("/api/niche-watch/scan", { method: "POST" });
+      const d = (await r.json().catch(() => ({}))) as {
+        error?: string;
+        started?: boolean;
+        total?: number;
+      };
+      if (r.status === 409) {
+        // Already running (auto-freshness, another tab, or a click that
+        // landed just before this one) — just start polling for it.
+        await refreshJob();
+        return;
+      }
+      if (!r.ok || !d.started) {
+        setScanError(d.error ?? `Scan failed (HTTP ${r.status})`);
+        return;
+      }
+      // Optimistic — the poll effect above (keyed on job?.running) takes
+      // over from here, same idiom as Sync All / OCR elsewhere.
+      setJob({
+        running: true,
+        done: 0,
+        total: d.total ?? niches.length,
+        current: null,
+        found: 0,
+        startedAt: Date.now(),
+      });
+    } catch (e) {
+      setScanError(e instanceof Error ? e.message : "Scan failed");
+    }
+  }, [refreshJob, niches.length]);
+
+  // Auto-freshness: there's no real background scheduler in this app
+  // yet, so a visit to the Signals tab substitutes for one — once the
+  // initial fetches resolve, if niches are configured, nothing is
+  // already running, and everything looks stale (no hit first-seen and
+  // no scan finished within AUTO_SCAN_FRESH_MS), kick a scan through the
+  // exact same runScan() path as clicking "Scan now". autoScanFired
+  // caps this at once per mount regardless of how often the effect's
+  // own dependencies (job, hits) subsequently change.
+  useEffect(() => {
+    if (loading) return;
+    if (autoScanFired.current) return;
+    if (niches.length === 0) return;
+    if (job?.running) return;
+
+    const jobFresh =
+      job !== null &&
+      job.finishedAt !== undefined &&
+      Date.now() - job.finishedAt < AUTO_SCAN_FRESH_MS;
+    const hitCutoffSec = Math.floor((Date.now() - AUTO_SCAN_FRESH_MS) / 1000);
+    const hitFresh = hits.some((h) => h.firstSeenAt > hitCutoffSec);
+    if (jobFresh || hitFresh) return;
+
+    autoScanFired.current = true;
+    runScan();
+  }, [loading, niches.length, job, hits, runScan]);
+
+  const removeNiche = useCallback(
+    async (id: number) => {
+      setChipError(null);
+      const removedNiche = niches.find((n) => n.id === id);
+      const removedHits = hits.filter((h) => h.nicheId === id);
+      // Optimistic — splice the niche (and its hits) out immediately,
+      // put them back plus an inline error if the DELETE fails. Same
+      // idiom as DismissAlertButton further down this file.
+      setNiches((prev) => prev.filter((n) => n.id !== id));
+      setHits((prev) => prev.filter((h) => h.nicheId !== id));
+      try {
+        const r = await fetch(`/api/niche-watch/${id}`, { method: "DELETE" });
+        if (!r.ok) {
+          const d = (await r.json().catch(() => ({}))) as { error?: string };
+          throw new Error(d.error ?? `Failed (HTTP ${r.status})`);
+        }
+      } catch (e) {
+        if (removedNiche) setNiches((prev) => [...prev, removedNiche]);
+        setHits((prev) => [...prev, ...removedHits]);
+        setChipError(e instanceof Error ? e.message : "Failed to remove niche");
+      }
+    },
+    [niches, hits]
+  );
+
+  const submitAdd = useCallback(async () => {
+    const trimmed = query.trim();
+    if (!trimmed) return;
+    setAdding(true);
+    setAddError(null);
+    try {
+      const r = await fetch("/api/niche-watch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: trimmed }),
+      });
+      const d = (await r.json().catch(() => ({}))) as { error?: string };
+      if (!r.ok) {
+        setAddError(d.error ?? `Failed (HTTP ${r.status})`);
+        return;
+      }
+      setQuery("");
+      // The POST response only echoes the raw niche row (no hitCount) —
+      // simplest to just re-fetch the summary list rather than patch it
+      // together locally.
+      await refresh();
+    } catch (e) {
+      setAddError(e instanceof Error ? e.message : "Failed to add niche");
+    } finally {
+      setAdding(false);
+    }
+  }, [query, refresh]);
+
+  // Top 15 by vph — the API already returns hits ORDER BY vph DESC, so
+  // this is purely a display cap, not a re-sort.
+  const topHits = useMemo(() => hits.slice(0, 15), [hits]);
+
+  // "Exploding" = vph at least 3x the median vph of the hits actually
+  // shown. Guarded to n >= 3 (and a positive median) so a 1-2 hit list —
+  // or a degenerate all-zero one — never trivially flags every row.
+  const medianVph = useMemo(
+    () => median(topHits.map((h) => h.vph).filter((v): v is number => v !== null)),
+    [topHits]
+  );
+  const explodingEnabled = topHits.length >= 3 && medianVph > 0;
+
+  const scanRunning =
+    job !== null && job.running && Date.now() - job.startedAt < SCAN_JOB_STALE_MS;
+  const scanLabel = `Scanning ${job?.done ?? 0}/${job?.total ?? 0}${
+    job?.current ? ` — ${truncateNiche(job.current)}` : "…"
+  }`;
+
+  if (loading) {
+    return (
+      <Card>
+        <CardContent className="flex items-center justify-center gap-2 py-10 text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading…
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <Radar className="h-4 w-4 text-sky-500" />
+          Niche watch
+          <span className="ml-auto text-xs font-normal text-muted-foreground">
+            {hits.length}
+          </span>
+        </CardTitle>
+        <CardDescription className="text-[11px]">
+          Each scan ≈ 100 API units per niche.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-3 pt-0">
+        {loadError && <p className="text-xs text-destructive">{loadError}</p>}
+
+        <div className="flex flex-wrap items-center gap-1.5">
+          {niches.map((n) => (
+            <NicheChip key={n.id} niche={n} onRemove={() => removeNiche(n.id)} />
+          ))}
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1.5">
+          {niches.length < MAX_WATCH_NICHES ? (
+            <>
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    submitAdd();
+                  }
+                }}
+                placeholder="Add a niche to watch — e.g. 'space documentary'"
+                disabled={adding}
+                className="h-8 w-72 max-w-full text-xs"
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={submitAdd}
+                disabled={adding || !query.trim()}
+                className="gap-1.5"
+              >
+                {adding ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : "Add"}
+              </Button>
+            </>
+          ) : (
+            <span className="text-xs text-muted-foreground">
+              {niches.length}/{MAX_WATCH_NICHES}
+            </span>
+          )}
+        </div>
+        {addError && <p className="text-xs text-destructive">{addError}</p>}
+        {chipError && <p className="text-xs text-destructive">{chipError}</p>}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={runScan}
+            disabled={scanRunning}
+            className="gap-1.5"
+          >
+            {scanRunning && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {scanRunning ? scanLabel : "Scan now"}
+          </Button>
+          {scanFlash && (
+            <span className="text-xs text-muted-foreground">{scanFlash}</span>
+          )}
+        </div>
+        {(scanError ?? job?.lastError) && (
+          <p className="text-xs text-destructive">{scanError ?? job?.lastError}</p>
+        )}
+
+        {niches.length === 0 ? (
+          <p className="py-6 text-center text-sm text-muted-foreground">
+            Watch niches are search phrases the app scans every visit (12h
+            cadence) for videos exploding right now — add up to 6.
+          </p>
+        ) : topHits.length === 0 ? (
+          <p className="py-6 text-center text-sm text-muted-foreground">
+            No hits yet — run a scan.
+          </p>
+        ) : (
+          <div className="space-y-1">
+            {topHits.map((h) => (
+              <NicheHitRow
+                key={`${h.nicheId}-${h.videoId}`}
+                hit={h}
+                exploding={explodingEnabled && (h.vph ?? 0) >= medianVph * 3}
+              />
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function NicheChip({
+  niche,
+  onRemove,
+}: {
+  niche: WatchNiche;
+  onRemove: () => void;
+}) {
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-1 text-xs">
+      {niche.query} ({niche.hitCount})
+      <button
+        type="button"
+        onClick={onRemove}
+        className="rounded-full p-0.5 text-muted-foreground/60 hover:bg-accent hover:text-foreground"
+        aria-label={`Remove niche "${niche.query}"`}
+        title="Remove niche"
+      >
+        <X className="h-3 w-3" />
+      </button>
+    </span>
+  );
+}
+
+function NicheHitRow({
+  hit: h,
+  exploding,
+}: {
+  hit: NicheHit;
+  exploding: boolean;
+}) {
+  const videoAge = fmtVideoAge(h.publishedAt);
+  const channel = h.channelTitle ?? "Unknown channel";
+  const draft: IdeaDraft = {
+    title: h.title ?? "Untitled video",
+    notes: `Niche watch "${h.nicheQuery}" · ${channel} · ${fmtCompact(
+      h.views
+    )} views · ${fmtVph(h.vph)}/h`,
+    source_type: "competitor_alert",
+    source_ref: h,
+  };
+
+  return (
+    <SignalRow
+      draft={draft}
+      generateType="fresh_outlier"
+      generateSignal={{
+        title: h.title,
+        competitor: h.channelTitle,
+        views: h.views,
+        kind: "niche",
+        vph: h.vph,
+        niche: h.nicheQuery,
+      }}
+    >
+      <div className="min-w-0 flex-1">
+        <a
+          href={youtubeUrl(h.videoId)}
+          target="_blank"
+          rel="noreferrer"
+          className="line-clamp-2 text-sm font-medium leading-snug hover:text-primary hover:underline"
+        >
+          {h.title ?? "Untitled video"}
+        </a>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          {h.nicheQuery} · {channel} · {fmtCompact(h.views)} views ·{" "}
+          {fmtVph(h.vph)}/h
+          {videoAge && ` · video: ${videoAge}`}
+        </p>
+        {exploding && (
+          <span
+            className="mt-1 inline-flex w-fit items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400"
+            title="Views-per-hour is at least 3x the median of the hits shown"
+          >
+            <Flame className="h-2.5 w-2.5" />
+            exploding
+          </span>
+        )}
+      </div>
+    </SignalRow>
   );
 }
 
