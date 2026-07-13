@@ -579,7 +579,7 @@ type FormulaCacheEntry = { text: string; ts: number };
 // they age out as harmless orphans in the settings table rather than
 // needing an explicit migration/delete.
 function formulaCacheKey(channelId: string): string {
-  return `packaging.formula.v2.${channelId}`;
+  return `packaging.formula.v3.${channelId}`;
 }
 
 /**
@@ -644,12 +644,21 @@ export async function packagingFormulaSummary(
   };
 
   const instruction = [
-    "From these REAL statistics of one YouTube channel, write the channel's winning packaging formula:",
-    "1) a one-line title structure template with placeholders,",
-    "2) a one-line thumbnail-text recipe,",
-    "3) 3 short bullet rules citing the numbers.",
+    "From these REAL statistics of one YouTube channel, write the channel's winning packaging formula.",
     "",
-    "Statistical honesty rules — follow all of them exactly:",
+    "AUDIENCE: a busy YouTuber with zero statistics background. The formula must read like a RECIPE they can apply in 30 seconds, not a research report. Plain words. Short sentences.",
+    "",
+    "STRUCTURE — exactly these sections, in this order:",
+    "1) '## Next video: do this' — the actionable recipe, 3 lines max:",
+    "   - Title: the winning template with placeholders, PLUS one fully worked example title for a plausible new topic on this channel.",
+    "   - Thumbnail: the text recipe in one short line, PLUS one worked example.",
+    "   - One 'never do' line (the single worst-performing habit in the data).",
+    "   No numbers in this section at all — it's the recipe, not the proof.",
+    "2) '## Why this works (the numbers)' — 3 short bullets backing the recipe with stats.",
+    "3) '## Worth testing (small sample)' — as specified below.",
+    "4) '## Data caveats' — as specified below.",
+    "",
+    "Statistical honesty rules — follow all of them exactly (they apply to sections 2-4):",
     "- Every quantitative rule MUST cite its sample size inline, in the form (n=17).",
     "- NEVER state a causal rule from a word or feature with fewer than 5 uses on each side (e.g. used only 5 times, or with fewer than 5 videos lacking it). Words/features below that bar may only be listed under a separate \"Worth testing (small sample)\" list, named with their use count but WITHOUT view numbers or any performance claim.",
     "- Prefer title-structure patterns (typically higher n) over thumbnail-word claims (typically lower n) when both are available — lead with what the larger sample supports.",
