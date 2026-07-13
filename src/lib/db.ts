@@ -4948,10 +4948,39 @@ export function moveIdea(
 
 export function deleteIdea(id: number): boolean {
   const activeId = requireActiveChannelId();
-  const info = db
-    .prepare(`DELETE FROM ideas WHERE id = ? AND channel_id = ?`)
-    .run(id, activeId);
-  return info.changes > 0;
+  // Renumber the survivors of the deleted card's stage so positions stay
+  // contiguous 0..n-1 — without this, repeated move/delete cycles leave
+  // ever-growing gaps (found by adversarial verification: a delete after a
+  // move left real cards stranded at positions 1..3). Same transactional
+  // renumber idiom as moveIdea above.
+  const tx = db.transaction((): boolean => {
+    const existing = db
+      .prepare(`SELECT stage FROM ideas WHERE id = ? AND channel_id = ?`)
+      .get(id, activeId) as { stage: IdeaStage } | undefined;
+    if (!existing) return false;
+
+    const info = db
+      .prepare(`DELETE FROM ideas WHERE id = ? AND channel_id = ?`)
+      .run(id, activeId);
+    if (info.changes === 0) return false;
+
+    const survivors = db
+      .prepare(
+        `SELECT id FROM ideas
+         WHERE channel_id = ? AND stage = ?
+         ORDER BY position ASC, created_at DESC`
+      )
+      .all(activeId, existing.stage) as { id: number }[];
+    const renumber = db.prepare(
+      `UPDATE ideas SET position = ? WHERE id = ? AND channel_id = ?`
+    );
+    survivors.forEach((s, idx) => {
+      renumber.run(idx, s.id, activeId);
+    });
+    return true;
+  });
+
+  return tx();
 }
 
 /* ------------------------------------------------------------------ *
