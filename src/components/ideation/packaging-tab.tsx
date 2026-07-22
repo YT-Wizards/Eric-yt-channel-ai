@@ -109,6 +109,8 @@ export function PackagingTab() {
   const [noActiveChannel, setNoActiveChannel] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshingFormula, setRefreshingFormula] = useState(false);
+  // Formula card is collapsed by default — see the comment on the card.
+  const [formulaOpen, setFormulaOpen] = useState(false);
 
   const load = useCallback(async (opts: { refreshFormula?: boolean } = {}) => {
     try {
@@ -232,27 +234,34 @@ export function PackagingTab() {
         </div>
       )}
 
-      {/* ---- Winning formula ---- */}
+      {/* ---- Winning formula ----
+          Collapsed by default: on channels with an established format the
+          prose mostly restates their own habits, so it reads as clutter.
+          The formula's real job is invisible anyway — it grounds the AI
+          "Generate title" calls in Signals — so the card stays one quiet
+          line until someone actually wants to read or refresh it. */}
       <Card>
         <CardContent className="p-4">
-          <div className="mb-2 flex items-center justify-between gap-2">
-            <div>
-              <h2 className="flex items-center gap-1.5 text-sm font-semibold">
-                <Trophy className="h-3.5 w-3.5" />
-                Winning formula
-              </h2>
-              <p className="mt-0.5 text-[11px] text-muted-foreground">
-                Rules cite sample sizes — small samples are listed as
-                &ldquo;worth testing&rdquo;, not facts.
-              </p>
-            </div>
-            {formula !== null && (
+          <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              onClick={() => setFormulaOpen((v) => !v)}
+              className="flex min-w-0 items-center gap-1.5 text-left"
+            >
+              <Trophy className="h-3.5 w-3.5 shrink-0" />
+              <span className="text-sm font-semibold">Winning formula</span>
+              <span className="truncate text-[11px] text-muted-foreground">
+                — feeds the AI &ldquo;Generate title&rdquo; in Signals ·{" "}
+                {formulaOpen ? "hide" : "show"}
+              </span>
+            </button>
+            {formulaOpen && formula !== null && (
               <Button
                 variant="ghost"
                 size="sm"
                 onClick={refreshFormula}
                 disabled={refreshingFormula}
-                className="h-7 gap-1.5 px-2 text-xs"
+                className="h-7 shrink-0 gap-1.5 px-2 text-xs"
               >
                 {refreshingFormula ? (
                   <Loader2 className="h-3 w-3 animate-spin" />
@@ -263,14 +272,22 @@ export function PackagingTab() {
               </Button>
             )}
           </div>
-          {formula !== null ? (
-            <p className="whitespace-pre-wrap text-xs leading-relaxed text-foreground">
-              {formula}
-            </p>
-          ) : (
-            <div className="py-4 text-center text-xs text-muted-foreground">
-              Add your Claude key in Integrations to generate the channel&rsquo;s
-              winning-formula summary.
+          {formulaOpen && (
+            <div className="mt-2">
+              <p className="mb-2 text-[11px] text-muted-foreground">
+                Rules cite sample sizes — small samples are listed as
+                &ldquo;worth testing&rdquo;, not facts.
+              </p>
+              {formula !== null ? (
+                <p className="whitespace-pre-wrap text-xs leading-relaxed text-foreground">
+                  {formula}
+                </p>
+              ) : (
+                <div className="py-4 text-center text-xs text-muted-foreground">
+                  Add your Claude key in Integrations to generate the
+                  channel&rsquo;s winning-formula summary.
+                </div>
+              )}
             </div>
           )}
         </CardContent>
